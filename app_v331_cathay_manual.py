@@ -19,7 +19,6 @@ for x in watchlist.split(","):
     if s.isdigit():   # 台股
         s = s + ".TW"
     symbols.append(s)
-    results = []
 
     for s in symbols:
         try:
