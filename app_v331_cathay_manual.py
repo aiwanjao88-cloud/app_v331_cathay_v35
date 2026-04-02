@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import requests
 import streamlit as st
@@ -6,7 +7,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 
-st.set_page_config(page_title="V36.8 雙面板進階版", layout="wide")
+st.set_page_config(page_title="V37 自動分組看板版", layout="wide")
 
 WATCHLIST_FILE = "watchlist_memory.json"
 HOLDINGS_FILE = "holdings_memory.json"
@@ -35,7 +36,8 @@ st.markdown("""
     border: 1px solid rgba(255,255,255,0.08);
     border-radius: 18px;
     padding: 14px;
-    min-height: 200px;
+    min-height: 220px;
+    margin-bottom: 12px;
 }
 
 .tag {
@@ -56,15 +58,9 @@ st.markdown("""
     color: #9CA3AF;
     font-size: 12px;
 }
-
 .big-number {
     font-size: 22px;
     font-weight: 800;
-}
-
-hr {
-    margin-top: 1rem;
-    margin-bottom: 1rem;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -115,7 +111,7 @@ def push_line(text: str):
         return False, f"LINE 推播例外：{e}"
 
 # =========================
-# 記憶功能
+# 記憶
 # =========================
 def load_watchlist_memory(default_value: str) -> str:
     try:
@@ -173,12 +169,17 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     out = out.dropna(subset=["Close"])
     return out
 
+def is_tw_symbol(symbol: str) -> bool:
+    symbol = str(symbol).strip().upper()
+    return bool(re.fullmatch(r"\d{4,6}[A-Z]{0,2}", symbol))
+
 def fetch_symbol_data(symbol: str, period: str = "1y") -> tuple[pd.DataFrame, str, str]:
     symbol = str(symbol).strip().upper()
+    clean_symbol = symbol.replace(".TW", "").replace(".TWO", "")
 
-    if symbol.isdigit():
+    if is_tw_symbol(clean_symbol):
         for suffix in [".TW", ".TWO"]:
-            real_symbol = symbol + suffix
+            real_symbol = clean_symbol + suffix
             try:
                 df = yf.download(real_symbol, period=period, progress=False, auto_adjust=True)
                 df = normalize_df(df)
@@ -186,7 +187,7 @@ def fetch_symbol_data(symbol: str, period: str = "1y") -> tuple[pd.DataFrame, st
                     return df, real_symbol, "台股"
             except Exception:
                 pass
-        return pd.DataFrame(), symbol, "台股"
+        return pd.DataFrame(), clean_symbol, "台股"
 
     try:
         df = yf.download(symbol, period=period, progress=False, auto_adjust=True)
@@ -464,13 +465,13 @@ def monitor_holdings(holdings_rows, capital, risk_percent):
 # =========================
 # 候選池
 # =========================
-TW_CANDIDATES = ["2330", "2317", "2454", "2382", "2303", "3037", "2376", "3017", "2603", "2609"]
+TW_CANDIDATES = ["2330", "2317", "2454", "2382", "2303", "3037", "2376", "3017", "2603", "2609", "00631L", "00637L"]
 US_CANDIDATES = ["NVDA", "AMD", "TSLA", "PLTR", "SMCI", "META", "AMZN", "AVGO", "MSFT", "QQQ"]
 
 # =========================
 # 預設狀態
 # =========================
-DEFAULT_WATCHLIST = "2330, 2317, NVDA, TSLA, AMD"
+DEFAULT_WATCHLIST = "2330, 2317, 00631L, NVDA, TSLA, AMD"
 if "watchlist" not in st.session_state:
     st.session_state.watchlist = load_watchlist_memory(DEFAULT_WATCHLIST)
 
@@ -489,8 +490,8 @@ if "holdings" not in st.session_state:
 # =========================
 # UI
 # =========================
-st.title("🛡️ V36.8 雙面板進階版")
-st.caption("庫存 + 候選股雙面板｜監控清單記憶｜A/B/C 級建倉卡片｜國泰手動下單")
+st.title("🛡️ V37 自動分組看板版")
+st.caption("A/B/C 分組看板｜台美股自動篩選｜庫存 + 候選股雙面板｜00631L 可查詢")
 
 st.subheader("📌 監控清單")
 watchlist = st.text_input("輸入股票（逗號分隔）", value=st.session_state.watchlist)
@@ -558,7 +559,7 @@ scan_holdings_btn = m4.button("監控現有庫存")
 test_line_clicked = m5.button("測試 LINE 推播")
 
 if test_line_clicked:
-    ok, msg = push_line("V36.8 測試推播成功")
+    ok, msg = push_line("V37 測試推播成功")
     if ok:
         st.success(msg)
     else:
@@ -593,161 +594,171 @@ holdings_result_df = pd.DataFrame()
 if scan_holdings_btn or (st.session_state.holdings and len(st.session_state.holdings) > 0):
     holdings_result_df = monitor_holdings(st.session_state.holdings, capital, risk_percent)
 
-# =========================
-# 雙面板
-# =========================
-left_col, right_col = st.columns([1, 1])
+candidate_df = pd.DataFrame(results) if results else pd.DataFrame()
+if not candidate_df.empty and only_tradeable:
+    candidate_df = candidate_df[candidate_df["訊號"] == "🟢 可打"]
 
-with left_col:
+a_df = pd.DataFrame()
+b_df = pd.DataFrame()
+c_df = pd.DataFrame()
+
+if not candidate_df.empty:
+    a_df = candidate_df[candidate_df["建倉優先級"] == "A級：可優先建倉"].copy()
+    b_df = candidate_df[candidate_df["建倉優先級"] == "B級：觀察等確認"].copy()
+    c_df = candidate_df[candidate_df["建倉優先級"] == "C級：先避開"].copy()
+
+# =========================
+# 看板區
+# =========================
+st.markdown("---")
+st.subheader("📊 自動分組看板")
+
+dashboard_col1, dashboard_col2 = st.columns(2)
+
+with dashboard_col1:
     st.markdown('<div class="panel">', unsafe_allow_html=True)
-    st.subheader("📦 現有庫存監控")
+    st.markdown("## 🟢 A級優先建倉")
+    if not a_df.empty:
+        st.dataframe(a_df, use_container_width=True)
+    else:
+        st.info("目前沒有 A級標的")
+    st.markdown('</div>', unsafe_allow_html=True)
 
+    st.markdown('<div class="panel">', unsafe_allow_html=True)
+    st.markdown("## 🔴 C級避開")
+    if not c_df.empty:
+        st.dataframe(c_df, use_container_width=True)
+    else:
+        st.info("目前沒有 C級標的")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+with dashboard_col2:
+    st.markdown('<div class="panel">', unsafe_allow_html=True)
+    st.markdown("## 🟡 B級觀察")
+    if not b_df.empty:
+        st.dataframe(b_df, use_container_width=True)
+    else:
+        st.info("目前沒有 B級標的")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="panel">', unsafe_allow_html=True)
+    st.markdown("## 📦 現有庫存警戒")
     if not holdings_result_df.empty:
-        st.dataframe(holdings_result_df, use_container_width=True)
-
         warning_df = holdings_result_df[
-            holdings_result_df["建議"].isin(["🚨 停損警戒", "🎯 停利觀察"])
+            holdings_result_df["建議"].isin(["🚨 停損警戒", "🎯 停利觀察", "⚠️ 考慮減碼"])
         ]
-
         if not warning_df.empty:
-            st.markdown("### 🚨 庫存重點提醒")
-            for _, r in warning_df.iterrows():
-                st.write(f"{r['股票']}｜損益 {r['損益%']}%｜{r['建議']}")
-
-            if ENABLE_LINE and st.button("推播庫存警戒到 LINE"):
-                msg_lines = ["📦 V36.8 庫存警戒提醒"]
-                for _, r in warning_df.iterrows():
-                    msg_lines.append(
-                        f"{r['股票']} | 損益:{r['損益%']}% | 建議:{r['建議']} | 現價:{r['現價']}"
-                    )
-                ok, msg = push_line("\n".join(msg_lines))
-                if ok:
-                    st.success("已推播庫存警戒")
-                else:
-                    st.warning(msg)
-    else:
-        st.info("目前沒有有效庫存資料")
-    st.markdown('</div>', unsafe_allow_html=True)
-
-with right_col:
-    st.markdown('<div class="panel">', unsafe_allow_html=True)
-    st.subheader("🎯 候選股 / 新建倉")
-
-    if results:
-        df_show = pd.DataFrame(results)
-
-        if only_tradeable:
-            df_show = df_show[df_show["訊號"] == "🟢 可打"]
-
-        st.dataframe(df_show, use_container_width=True)
-
-        priority_df = df_show[df_show["訊號"] == "🟢 可打"].copy()
-
-        if not priority_df.empty:
-            priority_df["優先排序"] = priority_df["建倉優先級"].map({
-                "A級：可優先建倉": 1,
-                "B級：觀察等確認": 2,
-                "C級：先避開": 3
-            })
-            priority_df = priority_df.sort_values(["優先排序", "雷達分數"], ascending=[True, False])
-
-            st.markdown("### 🔥 建倉優先名單")
-            st.dataframe(priority_df.drop(columns=["優先排序"]), use_container_width=True)
-
-            top3 = priority_df.head(3)
-
-            st.markdown("### 🏆 今日候選 Top 3")
-            cols = st.columns(min(3, len(top3)))
-
-            for i, (_, row) in enumerate(top3.iterrows()):
-                with cols[i]:
-                    priority = row["建倉優先級"]
-                    card_class = "card-a" if priority.startswith("A") else ("card-b" if priority.startswith("B") else "card-c")
-                    tag_class = "tag-green" if priority.startswith("A") else ("tag-yellow" if priority.startswith("B") else "tag-red")
-
-                    st.markdown(
-                        f"""
-                        <div class="card {card_class}">
-                            <div class="tag {tag_class}">{priority}</div>
-                            <div class="tag tag-blue">{row['市場']}</div>
-                            <div class="big-number">{row['股票']}</div>
-                            <p><b>訊號：</b>{row['訊號']}</p>
-                            <p><b>提醒：</b>{row['提醒']}</p>
-                            <p><b>現價：</b>{row['現價']}</p>
-                            <p><b>買進區：</b>{row['買進區下緣']} ~ {row['買進區上緣']}</p>
-                            <p><b>停損：</b>{row['停損價']}</p>
-                            <p><b>停利：</b>{row['停利價']}</p>
-                            <p><b>建議股數：</b>{row['建議股數']}</p>
-                            <p class="small-muted">{row['策略標記']}</p>
-                        </div>
-                        """,
-                        unsafe_allow_html=True
-                    )
-
-            if ENABLE_LINE and st.button("推播 A級 / 優先名單到 LINE"):
-                a_list = priority_df[priority_df["建倉優先級"] == "A級：可優先建倉"]
-                source_df = a_list if not a_list.empty else top3
-                msg_lines = ["🚦 V36.8 今日優先建倉名單"]
-                for _, row in source_df.iterrows():
-                    msg_lines.append(
-                        f"{row['股票']} | {row['建倉優先級']} | {row['訊號']} | 現價:{row['現價']} | 停損:{row['停損價']} | 停利:{row['停利價']}"
-                    )
-                ok, msg = push_line("\n".join(msg_lines))
-                if ok:
-                    st.success("已推播到 LINE")
-                else:
-                    st.warning(msg)
-
-            st.markdown("### 💰 國泰手動下單面板")
-            selected_symbol = st.selectbox("選擇候選標的", top3["股票"].tolist(), key="candidate_select")
-            selected_row = top3[top3["股票"] == selected_symbol].iloc[0]
-
-            order_price = st.number_input("下單價格", value=float(selected_row["現價"]), step=0.1, key="candidate_price")
-            order_qty = st.number_input("下單股數", value=max(int(selected_row["建議股數"]), 1), step=1, min_value=1, key="candidate_qty")
-            order_action = st.selectbox("操作", ["BUY 買進", "SELL 賣出", "REDUCE 減碼"], key="candidate_action")
-
-            st.markdown("### 🧾 下單摘要")
-            st.write(f"市場：{selected_row['市場']}")
-            st.write(f"標的：{selected_symbol}")
-            st.write(f"建倉優先級：{selected_row['建倉優先級']}")
-            st.write(f"訊號：{selected_row['訊號']}")
-            st.write(f"提醒：{selected_row['提醒']}")
-            st.write(f"策略標記：{selected_row['策略標記']}")
-            st.write(f"操作：{order_action}")
-            st.write(f"價格：{order_price}")
-            st.write(f"股數：{order_qty}")
-            st.write(f"停損：{selected_row['停損價']}")
-            st.write(f"停利：{selected_row['停利價']}")
-
-            if ENABLE_LINE and st.button("推播候選下單摘要到 LINE", key="candidate_line_push"):
-                msg = (
-                    f"🏛️ V36.8 候選股下單摘要\n"
-                    f"市場：{selected_row['市場']}\n"
-                    f"標的：{selected_symbol}\n"
-                    f"建倉優先級：{selected_row['建倉優先級']}\n"
-                    f"訊號：{selected_row['訊號']}\n"
-                    f"提醒：{selected_row['提醒']}\n"
-                    f"策略標記：{selected_row['策略標記']}\n"
-                    f"操作：{order_action}\n"
-                    f"價格：{order_price}\n"
-                    f"股數：{order_qty}\n"
-                    f"停損：{selected_row['停損價']}\n"
-                    f"停利：{selected_row['停利價']}"
-                )
-                ok, line_msg = push_line(msg)
-                if ok:
-                    st.success("已推播候選股下單摘要")
-                else:
-                    st.warning(line_msg)
+            st.dataframe(warning_df, use_container_width=True)
         else:
-            st.info("目前沒有可建倉候選股")
+            st.dataframe(holdings_result_df, use_container_width=True)
     else:
-        st.info("請先進行掃描")
+        st.info("目前沒有庫存資料")
     st.markdown('</div>', unsafe_allow_html=True)
+
+# =========================
+# 候選股操作中心
+# =========================
+st.markdown("---")
+st.subheader("💰 今日建倉操作中心")
+
+tradable_df = pd.DataFrame()
+if not a_df.empty:
+    tradable_df = a_df.copy()
+elif not b_df.empty:
+    tradable_df = b_df.copy()
+
+if not tradable_df.empty:
+    top3 = tradable_df.sort_values(["雷達分數", "現價"], ascending=[False, True]).head(3)
+
+    st.markdown("### 🏆 今日候選 Top 3")
+    cols = st.columns(min(3, len(top3)))
+
+    for i, (_, row) in enumerate(top3.iterrows()):
+        with cols[i]:
+            priority = row["建倉優先級"]
+            card_class = "card-a" if priority.startswith("A") else ("card-b" if priority.startswith("B") else "card-c")
+            tag_class = "tag-green" if priority.startswith("A") else ("tag-yellow" if priority.startswith("B") else "tag-red")
+
+            st.markdown(
+                f"""
+                <div class="card {card_class}">
+                    <div class="tag {tag_class}">{priority}</div>
+                    <div class="tag tag-blue">{row['市場']}</div>
+                    <div class="big-number">{row['股票']}</div>
+                    <p><b>訊號：</b>{row['訊號']}</p>
+                    <p><b>提醒：</b>{row['提醒']}</p>
+                    <p><b>現價：</b>{row['現價']}</p>
+                    <p><b>買進區：</b>{row['買進區下緣']} ~ {row['買進區上緣']}</p>
+                    <p><b>停損：</b>{row['停損價']}</p>
+                    <p><b>停利：</b>{row['停利價']}</p>
+                    <p><b>建議股數：</b>{row['建議股數']}</p>
+                    <p class="small-muted">{row['策略標記']}</p>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+    if ENABLE_LINE and st.button("推播 A級 / 優先名單到 LINE"):
+        a_list = tradable_df[tradable_df["建倉優先級"] == "A級：可優先建倉"]
+        source_df = a_list if not a_list.empty else top3
+        msg_lines = ["🚦 V37 今日優先建倉名單"]
+        for _, row in source_df.iterrows():
+            msg_lines.append(
+                f"{row['股票']} | {row['建倉優先級']} | {row['訊號']} | 現價:{row['現價']} | 停損:{row['停損價']} | 停利:{row['停利價']}"
+            )
+        ok, msg = push_line("\n".join(msg_lines))
+        if ok:
+            st.success("已推播到 LINE")
+        else:
+            st.warning(msg)
+
+    st.markdown("### 🧾 國泰手動下單摘要")
+    selected_symbol = st.selectbox("選擇候選標的", top3["股票"].tolist(), key="candidate_select")
+    selected_row = top3[top3["股票"] == selected_symbol].iloc[0]
+
+    order_price = st.number_input("下單價格", value=float(selected_row["現價"]), step=0.1, key="candidate_price")
+    order_qty = st.number_input("下單股數", value=max(int(selected_row["建議股數"]), 1), step=1, min_value=1, key="candidate_qty")
+    order_action = st.selectbox("操作", ["BUY 買進", "SELL 賣出", "REDUCE 減碼"], key="candidate_action")
+
+    st.write(f"市場：{selected_row['市場']}")
+    st.write(f"標的：{selected_symbol}")
+    st.write(f"建倉優先級：{selected_row['建倉優先級']}")
+    st.write(f"訊號：{selected_row['訊號']}")
+    st.write(f"提醒：{selected_row['提醒']}")
+    st.write(f"策略標記：{selected_row['策略標記']}")
+    st.write(f"操作：{order_action}")
+    st.write(f"價格：{order_price}")
+    st.write(f"股數：{order_qty}")
+    st.write(f"停損：{selected_row['停損價']}")
+    st.write(f"停利：{selected_row['停利價']}")
+
+    if ENABLE_LINE and st.button("推播 V37 候選股摘要到 LINE", key="candidate_line_push"):
+        msg = (
+            f"🏛️ V37 候選股下單摘要\n"
+            f"市場：{selected_row['市場']}\n"
+            f"標的：{selected_symbol}\n"
+            f"建倉優先級：{selected_row['建倉優先級']}\n"
+            f"訊號：{selected_row['訊號']}\n"
+            f"提醒：{selected_row['提醒']}\n"
+            f"策略標記：{selected_row['策略標記']}\n"
+            f"操作：{order_action}\n"
+            f"價格：{order_price}\n"
+            f"股數：{order_qty}\n"
+            f"停損：{selected_row['停損價']}\n"
+            f"停利：{selected_row['停利價']}"
+        )
+        ok, line_msg = push_line(msg)
+        if ok:
+            st.success("已推播候選股摘要")
+        else:
+            st.warning(line_msg)
+else:
+    st.info("目前沒有可操作標的")
 
 # =========================
 # 底部錯誤區
 # =========================
 if failed_symbols:
+    st.markdown("---")
     st.subheader("⚠️ 無法取得資料的股票")
     st.write(", ".join(failed_symbols))
