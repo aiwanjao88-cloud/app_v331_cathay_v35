@@ -6,7 +6,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 
-st.set_page_config(page_title="V36.3 飆股雷達版", layout="wide")
+st.set_page_config(page_title="V36.4 建倉優先級版", layout="wide")
 
 WATCHLIST_FILE = "watchlist_memory.json"
 
@@ -142,6 +142,16 @@ def get_fundamental_data(symbol: str):
         "earnings_growth": info.get("earningsGrowth", None),
     }
 
+def get_priority_level(radar_score, price, buy_zone_low, buy_zone_high, latest_vol, avg_vol20, breakout_ok):
+    near_buy_zone = buy_zone_low <= price <= buy_zone_high
+    vol_ok = latest_vol > avg_vol20 * 1.3
+
+    if radar_score >= 80 and near_buy_zone and (vol_ok or breakout_ok):
+        return "A級：可優先建倉"
+    elif radar_score >= 65:
+        return "B級：觀察等確認"
+    return "C級：先避開"
+
 def calc_radar_signal(df: pd.DataFrame, symbol: str, market: str, capital: float, risk_percent: float):
     close = df["Close"]
     high = df["High"]
@@ -163,18 +173,12 @@ def calc_radar_signal(df: pd.DataFrame, symbol: str, market: str, capital: float
 
     k, d = calc_kd(df)
 
-    # 旗竿判斷
     flagpole_return = (float(close.iloc[-1]) / float(close.iloc[-20]) - 1) * 100 if len(close) >= 20 else 0
-
-    # 整理突破判斷
     recent_10_high = float(high.rolling(10).max().iloc[-2]) if len(high) >= 11 else float(high.max())
     breakout_10 = price >= recent_10_high * 1.00
     volume_breakout = latest_vol > avg_vol20 * 1.5
-
-    # 不跌破 MA20
     consolidation_ok = price >= ma20 * 0.98
 
-    # 基本面
     f = get_fundamental_data(symbol)
 
     fundamental_score = 0
@@ -204,7 +208,6 @@ def calc_radar_signal(df: pd.DataFrame, symbol: str, market: str, capital: float
         fundamental_score += 10
         notes.append("規模/流動性較佳")
 
-    # 技術面
     technical_score = 0
 
     if latest_vol > avg_vol20 * 1.5:
@@ -265,6 +268,16 @@ def calc_radar_signal(df: pd.DataFrame, symbol: str, market: str, capital: float
     else:
         alert = "⛔ 先避開"
 
+    priority = get_priority_level(
+        radar_score=radar_score,
+        price=price,
+        buy_zone_low=buy_zone_low,
+        buy_zone_high=buy_zone_high,
+        latest_vol=latest_vol,
+        avg_vol20=avg_vol20,
+        breakout_ok=breakout_10
+    )
+
     return {
         "市場": market,
         "股票": symbol,
@@ -281,6 +294,7 @@ def calc_radar_signal(df: pd.DataFrame, symbol: str, market: str, capital: float
         "技術面分": technical_score,
         "訊號": signal,
         "提醒": alert,
+        "建倉優先級": priority,
         "買進區下緣": buy_zone_low,
         "買進區上緣": buy_zone_high,
         "停損價": stop_loss,
@@ -291,7 +305,7 @@ def calc_radar_signal(df: pd.DataFrame, symbol: str, market: str, capital: float
     }
 
 # =========================
-# 自動篩選候選池
+# 候選池
 # =========================
 TW_CANDIDATES = ["2330", "2317", "2454", "2382", "2303", "3037", "2376", "3017", "2603", "2609"]
 US_CANDIDATES = ["NVDA", "AMD", "TSLA", "PLTR", "SMCI", "META", "AMZN", "AVGO", "MSFT", "QQQ"]
@@ -315,8 +329,8 @@ if "only_tradeable" not in st.session_state:
 # =========================
 # UI
 # =========================
-st.title("🛡️ V36.3 飆股雷達版")
-st.caption("監控清單 + 台美股自動篩選器｜飆股雷達分數｜旗竿整理突破｜3新2益代理條件")
+st.title("🛡️ V36.4 建倉優先級版")
+st.caption("監控清單 + 自動篩選器｜飆股雷達分數｜建倉優先級｜國泰手動下單")
 
 st.subheader("📌 監控清單")
 watchlist = st.text_input("輸入股票（逗號分隔）", value=st.session_state.watchlist)
@@ -362,7 +376,7 @@ scan_us_auto = m3.button("美股自動篩選")
 test_line_clicked = m4.button("測試 LINE 推播")
 
 if test_line_clicked:
-    ok, msg = push_line("V36.3 測試推播成功")
+    ok, msg = push_line("V36.4 測試推播成功")
     if ok:
         st.success(msg)
     else:
@@ -407,18 +421,24 @@ if symbols_to_scan:
         st.subheader("📊 掃描結果")
         st.dataframe(df_show, use_container_width=True)
 
-        tradable = df_show[df_show["訊號"] == "🟢 可打"].sort_values(["雷達分數", "現價"], ascending=[False, True])
+        priority_df = df_show[df_show["訊號"] == "🟢 可打"].copy()
+        priority_df["優先排序"] = priority_df["建倉優先級"].map({
+            "A級：可優先建倉": 1,
+            "B級：觀察等確認": 2,
+            "C級：先避開": 3
+        })
+        priority_df = priority_df.sort_values(["優先排序", "雷達分數"], ascending=[True, False])
 
-        st.subheader("🔥 飆股雷達名單")
-        if not tradable.empty:
-            st.dataframe(tradable, use_container_width=True)
+        st.subheader("🔥 建倉優先名單")
+        if not priority_df.empty:
+            st.dataframe(priority_df.drop(columns=["優先排序"]), use_container_width=True)
         else:
-            st.info("目前沒有符合飆股雷達條件的標的")
+            st.info("目前沒有適合優先建倉的標的")
 
-        top3 = tradable.head(3)
+        top3 = priority_df.head(3)
         if not top3.empty:
             st.subheader("🎯 今日最強3檔")
-            st.dataframe(top3, use_container_width=True)
+            st.dataframe(top3.drop(columns=["優先排序"]), use_container_width=True)
 
             st.subheader("💰 國泰手動下單面板")
             selected_symbol = st.selectbox("選擇下單標的", top3["股票"].tolist())
@@ -431,6 +451,7 @@ if symbols_to_scan:
             st.markdown("### 🧾 下單摘要")
             st.write(f"市場：{selected_row['市場']}")
             st.write(f"標的：{selected_symbol}")
+            st.write(f"建倉優先級：{selected_row['建倉優先級']}")
             st.write(f"訊號：{selected_row['訊號']}")
             st.write(f"提醒：{selected_row['提醒']}")
             st.write(f"策略標記：{selected_row['策略標記']}")
@@ -442,9 +463,10 @@ if symbols_to_scan:
 
             if st.button("推播下單摘要到 LINE"):
                 msg = (
-                    f"🏛️ V36.3 國泰手動下單摘要\n"
+                    f"🏛️ V36.4 國泰手動下單摘要\n"
                     f"市場：{selected_row['市場']}\n"
                     f"標的：{selected_symbol}\n"
+                    f"建倉優先級：{selected_row['建倉優先級']}\n"
                     f"訊號：{selected_row['訊號']}\n"
                     f"提醒：{selected_row['提醒']}\n"
                     f"策略標記：{selected_row['策略標記']}\n"
