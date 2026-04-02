@@ -4,7 +4,7 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 
-st.set_page_config(page_title="V35.3 操盤面板", layout="wide")
+st.set_page_config(page_title="V35.4 國泰手動下單版", layout="wide")
 
 # =========================
 # LINE 設定
@@ -48,10 +48,116 @@ def push_line(text: str):
         return False, f"LINE 推播例外：{e}"
 
 # =========================
+# 工具：抓股票資料
+# =========================
+def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    out = df.copy()
+    if isinstance(out.columns, pd.MultiIndex):
+        out.columns = out.columns.get_level_values(0)
+
+    required_cols = ["Open", "High", "Low", "Close", "Volume"]
+    for c in required_cols:
+        if c not in out.columns:
+            return pd.DataFrame()
+
+    out = out.dropna(subset=["Close"])
+    return out
+
+def fetch_symbol_data(symbol: str, period: str = "6mo") -> tuple[pd.DataFrame, str]:
+    """
+    回傳 (df, real_symbol)
+    real_symbol 可能是 2330.TW / 2330.TWO / NVDA
+    """
+    symbol = symbol.strip().upper()
+
+    # 純數字 → 台股，自動測試 TW / TWO
+    if symbol.isdigit():
+        for suffix in [".TW", ".TWO"]:
+            real_symbol = symbol + suffix
+            try:
+                df = yf.download(real_symbol, period=period, progress=False, auto_adjust=True)
+                df = normalize_df(df)
+                if not df.empty and len(df) >= 60:
+                    return df, real_symbol
+            except Exception:
+                pass
+        return pd.DataFrame(), symbol
+
+    # 非純數字 → 美股或 ETF
+    try:
+        df = yf.download(symbol, period=period, progress=False, auto_adjust=True)
+        df = normalize_df(df)
+        if not df.empty and len(df) >= 60:
+            return df, symbol
+    except Exception:
+        pass
+
+    return pd.DataFrame(), symbol
+
+def calc_signal_from_df(df: pd.DataFrame, symbol: str, capital: float, risk_percent: float):
+    close = df["Close"]
+    high = df["High"]
+    low = df["Low"]
+
+    price = float(close.iloc[-1])
+    ma20 = float(close.rolling(20).mean().iloc[-1])
+    ma60 = float(close.rolling(60).mean().iloc[-1])
+
+    tr1 = high - low
+    tr2 = (high - close.shift(1)).abs()
+    tr3 = (low - close.shift(1)).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr14 = float(tr.rolling(14).mean().iloc[-1])
+
+    score = 0
+    if price > ma20:
+        score += 40
+    if ma20 > ma60:
+        score += 30
+    if price > ma60:
+        score += 20
+    if close.iloc[-1] > close.iloc[-5]:
+        score += 10
+
+    if score >= 80:
+        status = "🟢強勢"
+    elif price < ma20:
+        status = "🔴弱勢"
+    else:
+        status = "🟡觀望"
+
+    buy_zone_low = round(ma20 * 0.99, 2)
+    buy_zone_high = round(ma20 * 1.01, 2)
+    stop_loss = round(ma20 - atr14, 2)
+    take_profit = round(price + (price - stop_loss) * 2, 2)
+
+    risk_amount = capital * (risk_percent / 100)
+    per_share_risk = max(price - stop_loss, 0.01)
+    suggested_shares = int(risk_amount / per_share_risk)
+
+    return {
+        "股票": symbol,
+        "現價": round(price, 2),
+        "20MA": round(ma20, 2),
+        "60MA": round(ma60, 2),
+        "ATR14": round(atr14, 2),
+        "評分": score,
+        "狀態": status,
+        "買進區下緣": buy_zone_low,
+        "買進區上緣": buy_zone_high,
+        "停損價": stop_loss,
+        "停利價": take_profit,
+        "建議股數": suggested_shares
+    }
+
+# =========================
 # UI
 # =========================
-st.title("🛡️ V35.3 智能交易儀表板")
-st.caption("評分｜今日3檔｜買進區｜停損｜停利｜建議股數｜LINE通知")
+st.title("🛡️ V35.4 國泰手動下單版")
+st.caption("修正版｜台美股掃描｜今日3檔｜國泰手動下單｜LINE通知")
 
 watchlist = st.text_input("輸入股票（逗號分隔）", "2330, NVDA, TSLA")
 capital = st.number_input("總資金", min_value=10000, value=100000, step=10000)
@@ -62,95 +168,30 @@ scan_clicked = col1.button("開始掃描")
 test_line_clicked = col2.button("測試 LINE 推播")
 
 if test_line_clicked:
-    ok, msg = push_line("V35.3 測試推播成功")
+    ok, msg = push_line("V35.4 測試推播成功")
     if ok:
         st.success(msg)
     else:
         st.warning(msg)
 
-# 先定義，避免 NameError
 results = []
+failed_symbols = []
 
 if scan_clicked:
-    # 自動轉換台股代碼
-    symbols = []
-    for x in watchlist.split(","):
-        s = x.strip().upper()
-        if not s:
-            continue
-        if s.isdigit():
-            s = s + ".TW"
-        symbols.append(s)
+    symbols = [x.strip().upper() for x in watchlist.split(",") if x.strip()]
 
     for s in symbols:
-        try:
-            df = yf.download(s, period="6mo", progress=False, auto_adjust=True)
+        df, real_symbol = fetch_symbol_data(s)
 
-            if df.empty or len(df) < 60:
-                continue
-
-            close = df["Close"]
-            high = df["High"]
-            low = df["Low"]
-
-            price = float(close.iloc[-1])
-            ma20 = float(close.rolling(20).mean().iloc[-1])
-            ma60 = float(close.rolling(60).mean().iloc[-1])
-
-            # ATR 簡化算法
-            tr1 = high - low
-            tr2 = (high - close.shift(1)).abs()
-            tr3 = (low - close.shift(1)).abs()
-            tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-            atr14 = float(tr.rolling(14).mean().iloc[-1])
-
-            # 評分系統
-            score = 0
-            if price > ma20:
-                score += 40
-            if ma20 > ma60:
-                score += 30
-            if price > ma60:
-                score += 20
-            if close.iloc[-1] > close.iloc[-5]:
-                score += 10
-
-            # 狀態燈號
-            if score >= 80:
-                status = "🟢強勢"
-            elif price < ma20:
-                status = "🔴弱勢"
-            else:
-                status = "🟡觀望"
-
-            # 買進區 / 停損 / 停利
-            buy_zone_low = round(ma20 * 0.99, 2)
-            buy_zone_high = round(ma20 * 1.01, 2)
-            stop_loss = round(ma20 - atr14, 2)
-            take_profit = round(price + (price - stop_loss) * 2, 2)
-
-            # 單筆風險計算
-            risk_amount = capital * (risk_percent / 100)
-            per_share_risk = max(price - stop_loss, 0.01)
-            suggested_shares = int(risk_amount / per_share_risk)
-
-            results.append({
-                "股票": s,
-                "現價": round(price, 2),
-                "20MA": round(ma20, 2),
-                "60MA": round(ma60, 2),
-                "ATR14": round(atr14, 2),
-                "評分": score,
-                "狀態": status,
-                "買進區下緣": buy_zone_low,
-                "買進區上緣": buy_zone_high,
-                "停損價": stop_loss,
-                "停利價": take_profit,
-                "建議股數": suggested_shares
-            })
-
-        except Exception:
+        if df.empty:
+            failed_symbols.append(s)
             continue
+
+        try:
+            row = calc_signal_from_df(df, real_symbol, capital, risk_percent)
+            results.append(row)
+        except Exception:
+            failed_symbols.append(s)
 
     if results:
         df_show = pd.DataFrame(results)
@@ -177,9 +218,45 @@ if scan_clicked:
                 """
             )
 
-        # LINE 推播今日3檔
+        # =========================
+        # 國泰手動下單面板
+        # =========================
+        st.subheader("💰 國泰手動下單面板")
+
+        selected_symbol = st.selectbox("選擇下單標的", df_show["股票"].tolist())
+        selected_row = df_show[df_show["股票"] == selected_symbol].iloc[0]
+
+        order_price = st.number_input("下單價格", value=float(selected_row["現價"]), step=0.1)
+        order_qty = st.number_input("下單股數", value=int(selected_row["建議股數"]), step=1, min_value=1)
+        order_action = st.selectbox("操作", ["BUY 買進", "SELL 賣出", "REDUCE 減碼"])
+
+        st.markdown("### 🧾 下單摘要")
+        st.write(f"標的：{selected_symbol}")
+        st.write(f"操作：{order_action}")
+        st.write(f"價格：{order_price}")
+        st.write(f"股數：{order_qty}")
+        st.write(f"停損：{selected_row['停損價']}")
+        st.write(f"停利：{selected_row['停利價']}")
+
+        if st.button("推播下單摘要到 LINE"):
+            msg = (
+                f"🏛️ V35.4 國泰手動下單摘要\n"
+                f"標的：{selected_symbol}\n"
+                f"操作：{order_action}\n"
+                f"價格：{order_price}\n"
+                f"股數：{order_qty}\n"
+                f"停損：{selected_row['停損價']}\n"
+                f"停利：{selected_row['停利價']}"
+            )
+            ok, line_msg = push_line(msg)
+            if ok:
+                st.success("已推播到 LINE")
+            else:
+                st.warning(line_msg)
+
+        # 今日3檔推播
         if ENABLE_LINE:
-            msg_lines = ["🔥 V35.3 今日最強3檔"]
+            msg_lines = ["🔥 V35.4 今日最強3檔"]
             for _, row in top3.iterrows():
                 msg_lines.append(
                     f"{row['股票']} | {row['狀態']} | 現價:{row['現價']} | 停損:{row['停損價']} | 停利:{row['停利價']}"
@@ -187,8 +264,10 @@ if scan_clicked:
             ok, msg = push_line("\n".join(msg_lines))
             if ok:
                 st.success("已推播今日最強3檔到 LINE")
-            else:
-                st.warning(msg)
 
     else:
-        st.warning("查無資料，請確認股票代碼。")
+        st.warning("查無可用資料。")
+
+    if failed_symbols:
+        st.subheader("⚠️ 無法取得資料的股票")
+        st.write(", ".join(failed_symbols))
