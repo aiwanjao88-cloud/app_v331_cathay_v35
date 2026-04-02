@@ -5,7 +5,7 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 
-st.set_page_config(page_title="V36 監控清單記憶版", layout="wide")
+st.set_page_config(page_title="V36.1 進場提醒版", layout="wide")
 
 WATCHLIST_FILE = "watchlist_memory.json"
 
@@ -145,13 +145,10 @@ def calc_signal_from_df(df: pd.DataFrame, symbol: str, market: str, capital: flo
 
     if score >= 80:
         signal = "🟢 可打"
-        signal_color = "green"
     elif score >= 50:
         signal = "🟡 觀望"
-        signal_color = "yellow"
     else:
         signal = "🔴 避開"
-        signal_color = "red"
 
     buy_zone_low = round(ma20 * 0.99, 2)
     buy_zone_high = round(ma20 * 1.01, 2)
@@ -162,6 +159,20 @@ def calc_signal_from_df(df: pd.DataFrame, symbol: str, market: str, capital: flo
     per_share_risk = max(price - stop_loss, 0.01)
     suggested_shares = int(risk_amount / per_share_risk)
 
+    # 進場提醒判斷
+    if buy_zone_low <= price <= buy_zone_high and signal == "🟢 可打":
+        alert = "✅ 接近買點"
+    elif price < stop_loss:
+        alert = "🚨 跌破停損"
+    elif price >= take_profit:
+        alert = "🎯 到達停利觀察"
+    elif signal == "🟢 可打":
+        alert = "👀 可列入觀察"
+    elif signal == "🟡 觀望":
+        alert = "⏳ 等待確認"
+    else:
+        alert = "⛔ 先避開"
+
     return {
         "市場": market,
         "股票": symbol,
@@ -171,7 +182,7 @@ def calc_signal_from_df(df: pd.DataFrame, symbol: str, market: str, capital: flo
         "ATR14": round(atr14, 2),
         "評分": score,
         "訊號": signal,
-        "燈號": signal_color,
+        "提醒": alert,
         "買進區下緣": buy_zone_low,
         "買進區上緣": buy_zone_high,
         "停損價": stop_loss,
@@ -198,8 +209,8 @@ if "only_tradeable" not in st.session_state:
 # =========================
 # UI
 # =========================
-st.title("🛡️ V36 監控清單記憶版")
-st.caption("監控清單記憶｜小資進攻模式｜紅綠燈判斷｜國泰手動下單｜LINE通知")
+st.title("🛡️ V36.1 進場提醒版")
+st.caption("監控清單記憶｜進場提醒｜停損警示｜停利觀察｜國泰手動下單")
 
 st.subheader("📌 監控清單")
 watchlist = st.text_input("輸入股票（逗號分隔）", value=st.session_state.watchlist)
@@ -242,7 +253,7 @@ scan_clicked = col1.button("開始掃描")
 test_line_clicked = col2.button("測試 LINE 推播")
 
 if test_line_clicked:
-    ok, msg = push_line("V36 測試推播成功")
+    ok, msg = push_line("V36.1 測試推播成功")
     if ok:
         st.success(msg)
     else:
@@ -282,24 +293,12 @@ if scan_clicked:
         b.metric("🟡 觀望", int(yellow_count))
         c.metric("🔴 避開", int(red_count))
 
-        tab1, tab2, tab3 = st.tabs(["📊 全部", "🇹🇼 台股", "🇺🇸 美股"])
+        st.subheader("📊 掃描結果")
+        st.dataframe(df_show, use_container_width=True)
 
-        with tab1:
-            st.dataframe(df_show, use_container_width=True)
-
-        with tab2:
-            tw_df = df_show[df_show["市場"] == "台股"]
-            if not tw_df.empty:
-                st.dataframe(tw_df, use_container_width=True)
-            else:
-                st.info("目前沒有台股結果")
-
-        with tab3:
-            us_df = df_show[df_show["市場"] == "美股"]
-            if not us_df.empty:
-                st.dataframe(us_df, use_container_width=True)
-            else:
-                st.info("目前沒有美股結果")
+        st.subheader("🚦 進場提醒摘要")
+        for _, row in df_show.iterrows():
+            st.write(f"{row['股票']}｜{row['訊號']}｜{row['提醒']}")
 
         tradable = df_show[df_show["訊號"] == "🟢 可打"].sort_values(["評分", "現價"], ascending=[False, True])
 
@@ -313,22 +312,7 @@ if scan_clicked:
 
         if not top3.empty:
             st.subheader("🎯 今日最強3檔")
-            cols = st.columns(min(3, len(top3)))
-            for i, (_, row) in enumerate(top3.iterrows()):
-                with cols[i]:
-                    st.markdown(
-                        f"""
-                        ### {row['股票']}
-                        - 市場：**{row['市場']}**
-                        - 訊號：**{row['訊號']}**
-                        - 現價：**{row['現價']}**
-                        - 買進區：**{row['買進區下緣']} ~ {row['買進區上緣']}**
-                        - 停損：**{row['停損價']}**
-                        - 停利：**{row['停利價']}**
-                        - 建議股數：**{row['建議股數']}**
-                        - 評分：**{row['評分']}**
-                        """
-                    )
+            st.dataframe(top3, use_container_width=True)
 
             st.subheader("💰 國泰手動下單面板")
             selected_symbol = st.selectbox("選擇下單標的", top3["股票"].tolist())
@@ -342,6 +326,7 @@ if scan_clicked:
             st.write(f"市場：{selected_row['市場']}")
             st.write(f"標的：{selected_symbol}")
             st.write(f"訊號：{selected_row['訊號']}")
+            st.write(f"提醒：{selected_row['提醒']}")
             st.write(f"操作：{order_action}")
             st.write(f"價格：{order_price}")
             st.write(f"股數：{order_qty}")
@@ -350,10 +335,11 @@ if scan_clicked:
 
             if st.button("推播下單摘要到 LINE"):
                 msg = (
-                    f"🏛️ V36 國泰手動下單摘要\n"
+                    f"🏛️ V36.1 國泰手動下單摘要\n"
                     f"市場：{selected_row['市場']}\n"
                     f"標的：{selected_symbol}\n"
                     f"訊號：{selected_row['訊號']}\n"
+                    f"提醒：{selected_row['提醒']}\n"
                     f"操作：{order_action}\n"
                     f"價格：{order_price}\n"
                     f"股數：{order_qty}\n"
@@ -365,14 +351,6 @@ if scan_clicked:
                     st.success("已推播到 LINE")
                 else:
                     st.warning(line_msg)
-
-            if ENABLE_LINE:
-                msg_lines = ["🚦 V36 今日最強3檔"]
-                for _, row in top3.iterrows():
-                    msg_lines.append(
-                        f"{row['市場']} | {row['股票']} | {row['訊號']} | 現價:{row['現價']} | 停損:{row['停損價']} | 停利:{row['停利價']}"
-                    )
-                push_line("\n".join(msg_lines))
 
     else:
         st.warning("查無可用資料。")
