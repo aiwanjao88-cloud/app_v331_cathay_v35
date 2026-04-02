@@ -1,10 +1,13 @@
 import os
+import json
 import requests
 import streamlit as st
 import yfinance as yf
 import pandas as pd
 
-st.set_page_config(page_title="V35.6 訊號燈號強化版", layout="wide")
+st.set_page_config(page_title="V36 監控清單記憶版", layout="wide")
+
+WATCHLIST_FILE = "watchlist_memory.json"
 
 # =========================
 # LINE 設定
@@ -35,12 +38,7 @@ def push_line(text: str):
 
     payload = {
         "to": LINE_USER_ID,
-        "messages": [
-            {
-                "type": "text",
-                "text": text
-            }
-        ]
+        "messages": [{"type": "text", "text": text}]
     }
 
     try:
@@ -55,6 +53,26 @@ def push_line(text: str):
         return False, f"LINE 推播失敗：{r.status_code} | {r.text[:200]}"
     except Exception as e:
         return False, f"LINE 推播例外：{e}"
+
+# =========================
+# 記憶 watchlist
+# =========================
+def load_watchlist_memory(default_value: str) -> str:
+    try:
+        if os.path.exists(WATCHLIST_FILE):
+            with open(WATCHLIST_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return data.get("watchlist", default_value)
+    except Exception:
+        pass
+    return default_value
+
+def save_watchlist_memory(watchlist: str):
+    try:
+        with open(WATCHLIST_FILE, "w", encoding="utf-8") as f:
+            json.dump({"watchlist": watchlist}, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
 # =========================
 # 工具函式
@@ -162,22 +180,69 @@ def calc_signal_from_df(df: pd.DataFrame, symbol: str, market: str, capital: flo
     }
 
 # =========================
+# 預設狀態
+# =========================
+DEFAULT_WATCHLIST = "2330, 2317, NVDA, TSLA, AMD"
+if "watchlist" not in st.session_state:
+    st.session_state.watchlist = load_watchlist_memory(DEFAULT_WATCHLIST)
+
+if "capital" not in st.session_state:
+    st.session_state.capital = 100000
+
+if "risk_percent" not in st.session_state:
+    st.session_state.risk_percent = 1.0
+
+if "only_tradeable" not in st.session_state:
+    st.session_state.only_tradeable = False
+
+# =========================
 # UI
 # =========================
-st.title("🛡️ V35.6 訊號燈號強化版")
-st.caption("紅綠燈判斷｜台股 / 美股分流｜國泰手動下單｜LINE通知")
+st.title("🛡️ V36 監控清單記憶版")
+st.caption("監控清單記憶｜小資進攻模式｜紅綠燈判斷｜國泰手動下單｜LINE通知")
 
-watchlist = st.text_input("輸入股票（逗號分隔）", "2330, 2317, NVDA, TSLA, AMD")
-capital = st.number_input("總資金", min_value=10000, value=100000, step=10000)
-risk_percent = st.slider("單筆風險比例 (%)", min_value=0.5, max_value=5.0, value=1.0, step=0.5)
-only_tradeable = st.checkbox("只顯示 🟢 可打", value=False)
+st.subheader("📌 監控清單")
+watchlist = st.text_input("輸入股票（逗號分隔）", value=st.session_state.watchlist)
+save_watchlist_memory(watchlist)
+st.session_state.watchlist = watchlist
+
+st.subheader("⚙️ 資金模式")
+c1, c2, c3, c4 = st.columns(4)
+
+if c1.button("標準模式"):
+    st.session_state.capital = 100000
+    st.session_state.risk_percent = 1.0
+    st.session_state.only_tradeable = False
+
+if c2.button("小資可進攻 20K"):
+    st.session_state.capital = 20000
+    st.session_state.risk_percent = 2.0
+    st.session_state.only_tradeable = True
+
+if c3.button("進攻 30K"):
+    st.session_state.capital = 30000
+    st.session_state.risk_percent = 2.0
+    st.session_state.only_tradeable = True
+
+if c4.button("積極 50K"):
+    st.session_state.capital = 50000
+    st.session_state.risk_percent = 1.5
+    st.session_state.only_tradeable = True
+
+capital = st.number_input("總資金", min_value=10000, value=int(st.session_state.capital), step=10000)
+risk_percent = st.slider("單筆風險比例 (%)", min_value=0.5, max_value=5.0, value=float(st.session_state.risk_percent), step=0.5)
+only_tradeable = st.checkbox("只顯示 🟢 可打", value=st.session_state.only_tradeable)
+
+st.session_state.capital = capital
+st.session_state.risk_percent = risk_percent
+st.session_state.only_tradeable = only_tradeable
 
 col1, col2 = st.columns([1, 1])
 scan_clicked = col1.button("開始掃描")
 test_line_clicked = col2.button("測試 LINE 推播")
 
 if test_line_clicked:
-    ok, msg = push_line("V35.6 測試推播成功")
+    ok, msg = push_line("V36 測試推播成功")
     if ok:
         st.success(msg)
     else:
@@ -212,15 +277,14 @@ if scan_clicked:
         yellow_count = (df_show["訊號"] == "🟡 觀望").sum() if not df_show.empty else 0
         red_count = (df_show["訊號"] == "🔴 避開").sum() if not df_show.empty else 0
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("🟢 可打", int(green_count))
-        c2.metric("🟡 觀望", int(yellow_count))
-        c3.metric("🔴 避開", int(red_count))
+        a, b, c = st.columns(3)
+        a.metric("🟢 可打", int(green_count))
+        b.metric("🟡 觀望", int(yellow_count))
+        c.metric("🔴 避開", int(red_count))
 
         tab1, tab2, tab3 = st.tabs(["📊 全部", "🇹🇼 台股", "🇺🇸 美股"])
 
         with tab1:
-            st.subheader("全部掃描結果")
             st.dataframe(df_show, use_container_width=True)
 
         with tab2:
@@ -249,7 +313,6 @@ if scan_clicked:
 
         if not top3.empty:
             st.subheader("🎯 今日最強3檔")
-
             cols = st.columns(min(3, len(top3)))
             for i, (_, row) in enumerate(top3.iterrows()):
                 with cols[i]:
@@ -272,12 +335,13 @@ if scan_clicked:
             selected_row = top3[top3["股票"] == selected_symbol].iloc[0]
 
             order_price = st.number_input("下單價格", value=float(selected_row["現價"]), step=0.1)
-            order_qty = st.number_input("下單股數", value=int(selected_row["建議股數"]), step=1, min_value=1)
+            order_qty = st.number_input("下單股數", value=max(int(selected_row["建議股數"]), 1), step=1, min_value=1)
             order_action = st.selectbox("操作", ["BUY 買進", "SELL 賣出", "REDUCE 減碼"])
 
             st.markdown("### 🧾 下單摘要")
             st.write(f"市場：{selected_row['市場']}")
             st.write(f"標的：{selected_symbol}")
+            st.write(f"訊號：{selected_row['訊號']}")
             st.write(f"操作：{order_action}")
             st.write(f"價格：{order_price}")
             st.write(f"股數：{order_qty}")
@@ -286,7 +350,7 @@ if scan_clicked:
 
             if st.button("推播下單摘要到 LINE"):
                 msg = (
-                    f"🏛️ V35.6 國泰手動下單摘要\n"
+                    f"🏛️ V36 國泰手動下單摘要\n"
                     f"市場：{selected_row['市場']}\n"
                     f"標的：{selected_symbol}\n"
                     f"訊號：{selected_row['訊號']}\n"
@@ -303,7 +367,7 @@ if scan_clicked:
                     st.warning(line_msg)
 
             if ENABLE_LINE:
-                msg_lines = ["🚦 V35.6 今日最強3檔"]
+                msg_lines = ["🚦 V36 今日最強3檔"]
                 for _, row in top3.iterrows():
                     msg_lines.append(
                         f"{row['市場']} | {row['股票']} | {row['訊號']} | 現價:{row['現價']} | 停損:{row['停損價']} | 停利:{row['停利價']}"
