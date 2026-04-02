@@ -6,7 +6,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 
-st.set_page_config(page_title="V36.2 自動篩選器版", layout="wide")
+st.set_page_config(page_title="V36.3 飆股雷達版", layout="wide")
 
 WATCHLIST_FILE = "watchlist_memory.json"
 
@@ -103,7 +103,7 @@ def fetch_symbol_data(symbol: str, period: str = "1y") -> tuple[pd.DataFrame, st
             try:
                 df = yf.download(real_symbol, period=period, progress=False, auto_adjust=True)
                 df = normalize_df(df)
-                if not df.empty and len(df) >= 100:
+                if not df.empty and len(df) >= 120:
                     return df, real_symbol, "台股"
             except Exception:
                 pass
@@ -112,7 +112,7 @@ def fetch_symbol_data(symbol: str, period: str = "1y") -> tuple[pd.DataFrame, st
     try:
         df = yf.download(symbol, period=period, progress=False, auto_adjust=True)
         df = normalize_df(df)
-        if not df.empty and len(df) >= 100:
+        if not df.empty and len(df) >= 120:
             return df, symbol, "美股"
     except Exception:
         pass
@@ -128,31 +128,21 @@ def calc_kd(df: pd.DataFrame, n=9):
     return float(k.iloc[-1]), float(d.iloc[-1])
 
 def get_fundamental_data(symbol: str):
-    """
-    盡量抓，但不保證每檔都有完整資料
-    """
     try:
         tk = yf.Ticker(symbol)
         info = tk.info if tk.info else {}
     except Exception:
         info = {}
 
-    pe = info.get("trailingPE", None)
-    market_cap = info.get("marketCap", None)
-    profit_margin = info.get("profitMargins", None)
-    revenue_growth = info.get("revenueGrowth", None)
-    earnings_growth = info.get("earningsGrowth", None)
-
-    # 股本替代估法：market cap 有抓到就當作流動性/規模參考
     return {
-        "pe": pe,
-        "market_cap": market_cap,
-        "profit_margin": profit_margin,
-        "revenue_growth": revenue_growth,
-        "earnings_growth": earnings_growth
+        "pe": info.get("trailingPE", None),
+        "market_cap": info.get("marketCap", None),
+        "profit_margin": info.get("profitMargins", None),
+        "revenue_growth": info.get("revenueGrowth", None),
+        "earnings_growth": info.get("earningsGrowth", None),
     }
 
-def calc_screening_signal(df: pd.DataFrame, symbol: str, market: str, capital: float, risk_percent: float):
+def calc_radar_signal(df: pd.DataFrame, symbol: str, market: str, capital: float, risk_percent: float):
     close = df["Close"]
     high = df["High"]
     low = df["Low"]
@@ -173,29 +163,38 @@ def calc_screening_signal(df: pd.DataFrame, symbol: str, market: str, capital: f
 
     k, d = calc_kd(df)
 
-    # 旗竿概念：近20日漲幅
+    # 旗竿判斷
     flagpole_return = (float(close.iloc[-1]) / float(close.iloc[-20]) - 1) * 100 if len(close) >= 20 else 0
 
-    # 整理突破概念：近10日高點突破
-    breakout_10 = price >= float(high.rolling(10).max().iloc[-1]) * 0.995
+    # 整理突破判斷
+    recent_10_high = float(high.rolling(10).max().iloc[-2]) if len(high) >= 11 else float(high.max())
+    breakout_10 = price >= recent_10_high * 1.00
+    volume_breakout = latest_vol > avg_vol20 * 1.5
+
+    # 不跌破 MA20
+    consolidation_ok = price >= ma20 * 0.98
 
     # 基本面
     f = get_fundamental_data(symbol)
 
     fundamental_score = 0
     notes = []
+    strategy_tags = []
 
     if f["profit_margin"] is not None and f["profit_margin"] > 0:
         fundamental_score += 15
         notes.append("獲利能力正向")
+        strategy_tags.append("2益-獲利")
 
-    if f["revenue_growth"] is not None and f["revenue_growth"] > 0:
+    if f["revenue_growth"] is not None and f["revenue_growth"] > 0.10:
         fundamental_score += 15
-        notes.append("營收成長正向")
+        notes.append("營收雙位數成長")
+        strategy_tags.append("2益-高成長")
 
     if f["earnings_growth"] is not None and f["earnings_growth"] > 0:
         fundamental_score += 10
         notes.append("EPS成長正向")
+        strategy_tags.append("2益-EPS")
 
     if f["pe"] is not None and f["pe"] > 0 and f["pe"] < 15:
         fundamental_score += 10
@@ -211,6 +210,7 @@ def calc_screening_signal(df: pd.DataFrame, symbol: str, market: str, capital: f
     if latest_vol > avg_vol20 * 1.5:
         technical_score += 20
         notes.append("近期爆量")
+        strategy_tags.append("3新-新買盤")
 
     if price > ma20 and ma20 > ma60:
         technical_score += 20
@@ -224,20 +224,21 @@ def calc_screening_signal(df: pd.DataFrame, symbol: str, market: str, capital: f
         technical_score += 10
         notes.append("KD 高檔鈍化")
 
-    if breakout_10:
-        technical_score += 15
-        notes.append("接近突破整理區")
+    if breakout_10 and volume_breakout and consolidation_ok:
+        technical_score += 20
+        notes.append("帶量突破整理區")
+        strategy_tags.append("旗竿整理突破")
 
     if flagpole_return > 15:
         technical_score += 10
         notes.append("旗竿動能明顯")
+        strategy_tags.append("旗竿原理")
 
-    total_score = fundamental_score + technical_score
+    radar_score = fundamental_score + technical_score
 
-    # 訊號燈號
-    if total_score >= 70:
+    if radar_score >= 75:
         signal = "🟢 可打"
-    elif total_score >= 45:
+    elif radar_score >= 50:
         signal = "🟡 觀望"
     else:
         signal = "🔴 避開"
@@ -251,7 +252,6 @@ def calc_screening_signal(df: pd.DataFrame, symbol: str, market: str, capital: f
     per_share_risk = max(price - stop_loss, 0.01)
     suggested_shares = int(risk_amount / per_share_risk)
 
-    # 提醒
     if buy_zone_low <= price <= buy_zone_high and signal == "🟢 可打":
         alert = "✅ 接近買點"
     elif price < stop_loss:
@@ -276,9 +276,9 @@ def calc_screening_signal(df: pd.DataFrame, symbol: str, market: str, capital: f
         "KD_K": round(k, 2),
         "KD_D": round(d, 2),
         "旗竿漲幅%": round(flagpole_return, 2),
+        "雷達分數": radar_score,
         "基本面分": fundamental_score,
         "技術面分": technical_score,
-        "總分": total_score,
         "訊號": signal,
         "提醒": alert,
         "買進區下緣": buy_zone_low,
@@ -286,6 +286,7 @@ def calc_screening_signal(df: pd.DataFrame, symbol: str, market: str, capital: f
         "停損價": stop_loss,
         "停利價": take_profit,
         "建議股數": suggested_shares,
+        "策略標記": " / ".join(strategy_tags[:4]) if strategy_tags else "一般強勢",
         "備註": " / ".join(notes[:5]) if notes else "資料有限"
     }
 
@@ -314,8 +315,8 @@ if "only_tradeable" not in st.session_state:
 # =========================
 # UI
 # =========================
-st.title("🛡️ V36.2 自動篩選器版")
-st.caption("監控清單 + 台美股自動篩選器｜飆股綜合條件｜國泰手動下單")
+st.title("🛡️ V36.3 飆股雷達版")
+st.caption("監控清單 + 台美股自動篩選器｜飆股雷達分數｜旗竿整理突破｜3新2益代理條件")
 
 st.subheader("📌 監控清單")
 watchlist = st.text_input("輸入股票（逗號分隔）", value=st.session_state.watchlist)
@@ -361,7 +362,7 @@ scan_us_auto = m3.button("美股自動篩選")
 test_line_clicked = m4.button("測試 LINE 推播")
 
 if test_line_clicked:
-    ok, msg = push_line("V36.2 測試推播成功")
+    ok, msg = push_line("V36.3 測試推播成功")
     if ok:
         st.success(msg)
     else:
@@ -369,7 +370,6 @@ if test_line_clicked:
 
 results = []
 failed_symbols = []
-
 symbols_to_scan = []
 
 if scan_watchlist:
@@ -388,7 +388,7 @@ if symbols_to_scan:
             continue
 
         try:
-            row = calc_screening_signal(df, real_symbol, market, capital, risk_percent)
+            row = calc_radar_signal(df, real_symbol, market, capital, risk_percent)
             results.append(row)
         except Exception:
             failed_symbols.append(s)
@@ -407,13 +407,13 @@ if symbols_to_scan:
         st.subheader("📊 掃描結果")
         st.dataframe(df_show, use_container_width=True)
 
-        tradable = df_show[df_show["訊號"] == "🟢 可打"].sort_values(["總分", "現價"], ascending=[False, True])
+        tradable = df_show[df_show["訊號"] == "🟢 可打"].sort_values(["雷達分數", "現價"], ascending=[False, True])
 
-        st.subheader("🔥 今日可打名單")
+        st.subheader("🔥 飆股雷達名單")
         if not tradable.empty:
             st.dataframe(tradable, use_container_width=True)
         else:
-            st.info("今天沒有符合條件的可打標的")
+            st.info("目前沒有符合飆股雷達條件的標的")
 
         top3 = tradable.head(3)
         if not top3.empty:
@@ -433,26 +433,26 @@ if symbols_to_scan:
             st.write(f"標的：{selected_symbol}")
             st.write(f"訊號：{selected_row['訊號']}")
             st.write(f"提醒：{selected_row['提醒']}")
+            st.write(f"策略標記：{selected_row['策略標記']}")
             st.write(f"操作：{order_action}")
             st.write(f"價格：{order_price}")
             st.write(f"股數：{order_qty}")
             st.write(f"停損：{selected_row['停損價']}")
             st.write(f"停利：{selected_row['停利價']}")
-            st.write(f"備註：{selected_row['備註']}")
 
             if st.button("推播下單摘要到 LINE"):
                 msg = (
-                    f"🏛️ V36.2 國泰手動下單摘要\n"
+                    f"🏛️ V36.3 國泰手動下單摘要\n"
                     f"市場：{selected_row['市場']}\n"
                     f"標的：{selected_symbol}\n"
                     f"訊號：{selected_row['訊號']}\n"
                     f"提醒：{selected_row['提醒']}\n"
+                    f"策略標記：{selected_row['策略標記']}\n"
                     f"操作：{order_action}\n"
                     f"價格：{order_price}\n"
                     f"股數：{order_qty}\n"
                     f"停損：{selected_row['停損價']}\n"
-                    f"停利：{selected_row['停利價']}\n"
-                    f"備註：{selected_row['備註']}"
+                    f"停利：{selected_row['停利價']}"
                 )
                 ok, line_msg = push_line(msg)
                 if ok:
