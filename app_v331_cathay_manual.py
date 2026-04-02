@@ -25,14 +25,40 @@ def push_line(text: str):
     if not ENABLE_LINE:
         return False, "未設定 LINE_TOKEN / LINE_USER_ID"
 
+    # 防呆：避免 secrets 還是中文測試字
+    if any(ord(ch) > 127 for ch in LINE_TOKEN) or any(ord(ch) > 127 for ch in LINE_USER_ID):
+        return False, "LINE_TOKEN / LINE_USER_ID 內含非英文字符，請到 .streamlit/secrets.toml 改成真正的 LINE 憑證"
+
     headers = {
-        "Content-Type": "application/json",
+        "Content-Type": "application/json; charset=utf-8",
         "Authorization": f"Bearer {LINE_TOKEN}"
     }
+
     payload = {
         "to": LINE_USER_ID,
-        "messages": [{"type": "text", "text": text}]
+        "messages": [
+            {
+                "type": "text",
+                "text": text
+            }
+        ]
     }
+
+    try:
+        r = requests.post(
+            "https://api.line.me/v2/bot/message/push",
+            headers=headers,
+            json=payload,
+            timeout=10
+        )
+
+        if 200 <= r.status_code < 300:
+            return True, "LINE 推播成功"
+
+        return False, f"LINE 推播失敗：{r.status_code} | {r.text[:200]}"
+
+    except Exception as e:
+        return False, f"LINE 推播例外：{e}"
 
     try:
         r = requests.post(
