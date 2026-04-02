@@ -4,7 +4,7 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 
-st.set_page_config(page_title="V35.5 多市場監控版", layout="wide")
+st.set_page_config(page_title="V35.6 訊號燈號強化版", layout="wide")
 
 # =========================
 # LINE 設定
@@ -25,9 +25,8 @@ def push_line(text: str):
     if not ENABLE_LINE:
         return False, "未設定 LINE_TOKEN / LINE_USER_ID"
 
-    # 防呆：避免 secrets 還是中文測試字
     if any(ord(ch) > 127 for ch in LINE_TOKEN) or any(ord(ch) > 127 for ch in LINE_USER_ID):
-        return False, "LINE_TOKEN / LINE_USER_ID 內含非英文字符，請到 .streamlit/secrets.toml 改成真正的 LINE 憑證"
+        return False, "LINE_TOKEN / LINE_USER_ID 內含非英文字符，請檢查 secrets.toml"
 
     headers = {
         "Content-Type": "application/json; charset=utf-8",
@@ -51,25 +50,9 @@ def push_line(text: str):
             json=payload,
             timeout=10
         )
-
         if 200 <= r.status_code < 300:
             return True, "LINE 推播成功"
-
         return False, f"LINE 推播失敗：{r.status_code} | {r.text[:200]}"
-
-    except Exception as e:
-        return False, f"LINE 推播例外：{e}"
-
-    try:
-        r = requests.post(
-            "https://api.line.me/v2/bot/message/push",
-            headers=headers,
-            json=payload,
-            timeout=10
-        )
-        if 200 <= r.status_code < 300:
-            return True, "LINE 推播成功"
-        return False, f"LINE 推播失敗：{r.status_code}"
     except Exception as e:
         return False, f"LINE 推播例外：{e}"
 
@@ -93,10 +76,6 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 def fetch_symbol_data(symbol: str, period: str = "6mo") -> tuple[pd.DataFrame, str, str]:
-    """
-    回傳: (df, real_symbol, market)
-    market: 台股 / 美股
-    """
     symbol = symbol.strip().upper()
 
     if symbol.isdigit():
@@ -147,11 +126,14 @@ def calc_signal_from_df(df: pd.DataFrame, symbol: str, market: str, capital: flo
         score += 10
 
     if score >= 80:
-        status = "🟢強勢"
-    elif price < ma20:
-        status = "🔴弱勢"
+        signal = "🟢 可打"
+        signal_color = "green"
+    elif score >= 50:
+        signal = "🟡 觀望"
+        signal_color = "yellow"
     else:
-        status = "🟡觀望"
+        signal = "🔴 避開"
+        signal_color = "red"
 
     buy_zone_low = round(ma20 * 0.99, 2)
     buy_zone_high = round(ma20 * 1.01, 2)
@@ -170,7 +152,8 @@ def calc_signal_from_df(df: pd.DataFrame, symbol: str, market: str, capital: flo
         "60MA": round(ma60, 2),
         "ATR14": round(atr14, 2),
         "評分": score,
-        "狀態": status,
+        "訊號": signal,
+        "燈號": signal_color,
         "買進區下緣": buy_zone_low,
         "買進區上緣": buy_zone_high,
         "停損價": stop_loss,
@@ -181,20 +164,20 @@ def calc_signal_from_df(df: pd.DataFrame, symbol: str, market: str, capital: flo
 # =========================
 # UI
 # =========================
-st.title("🛡️ V35.5 多市場監控版")
-st.caption("台股 / 美股分流｜今日可打名單｜國泰手動下單｜LINE通知")
+st.title("🛡️ V35.6 訊號燈號強化版")
+st.caption("紅綠燈判斷｜台股 / 美股分流｜國泰手動下單｜LINE通知")
 
 watchlist = st.text_input("輸入股票（逗號分隔）", "2330, 2317, NVDA, TSLA, AMD")
 capital = st.number_input("總資金", min_value=10000, value=100000, step=10000)
 risk_percent = st.slider("單筆風險比例 (%)", min_value=0.5, max_value=5.0, value=1.0, step=0.5)
-only_strong = st.checkbox("只顯示強勢股", value=False)
+only_tradeable = st.checkbox("只顯示 🟢 可打", value=False)
 
 col1, col2 = st.columns([1, 1])
 scan_clicked = col1.button("開始掃描")
 test_line_clicked = col2.button("測試 LINE 推播")
 
 if test_line_clicked:
-    ok, msg = push_line("V35.5 測試推播成功")
+    ok, msg = push_line("V35.6 測試推播成功")
     if ok:
         st.success(msg)
     else:
@@ -222,12 +205,17 @@ if scan_clicked:
     if results:
         df_show = pd.DataFrame(results)
 
-        if only_strong:
-            df_show = df_show[df_show["狀態"] == "🟢強勢"]
+        if only_tradeable:
+            df_show = df_show[df_show["訊號"] == "🟢 可打"]
 
-        # 台股 / 美股分頁
-        tw_df = df_show[df_show["市場"] == "台股"]
-        us_df = df_show[df_show["市場"] == "美股"]
+        green_count = (df_show["訊號"] == "🟢 可打").sum() if not df_show.empty else 0
+        yellow_count = (df_show["訊號"] == "🟡 觀望").sum() if not df_show.empty else 0
+        red_count = (df_show["訊號"] == "🔴 避開").sum() if not df_show.empty else 0
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("🟢 可打", int(green_count))
+        c2.metric("🟡 觀望", int(yellow_count))
+        c3.metric("🔴 避開", int(red_count))
 
         tab1, tab2, tab3 = st.tabs(["📊 全部", "🇹🇼 台股", "🇺🇸 美股"])
 
@@ -236,33 +224,48 @@ if scan_clicked:
             st.dataframe(df_show, use_container_width=True)
 
         with tab2:
-            st.subheader("台股掃描結果")
+            tw_df = df_show[df_show["市場"] == "台股"]
             if not tw_df.empty:
                 st.dataframe(tw_df, use_container_width=True)
             else:
                 st.info("目前沒有台股結果")
 
         with tab3:
-            st.subheader("美股掃描結果")
+            us_df = df_show[df_show["市場"] == "美股"]
             if not us_df.empty:
                 st.dataframe(us_df, use_container_width=True)
             else:
                 st.info("目前沒有美股結果")
 
-        # 今日可打名單
-        tradable = df_show[df_show["狀態"] == "🟢強勢"].sort_values(["評分", "現價"], ascending=[False, True])
+        tradable = df_show[df_show["訊號"] == "🟢 可打"].sort_values(["評分", "現價"], ascending=[False, True])
 
         st.subheader("🔥 今日可打名單")
         if not tradable.empty:
             st.dataframe(tradable, use_container_width=True)
         else:
-            st.info("今天沒有明確強勢股")
+            st.info("今天沒有明確可打標的")
 
         top3 = tradable.head(3)
 
         if not top3.empty:
             st.subheader("🎯 今日最強3檔")
-            st.dataframe(top3, use_container_width=True)
+
+            cols = st.columns(min(3, len(top3)))
+            for i, (_, row) in enumerate(top3.iterrows()):
+                with cols[i]:
+                    st.markdown(
+                        f"""
+                        ### {row['股票']}
+                        - 市場：**{row['市場']}**
+                        - 訊號：**{row['訊號']}**
+                        - 現價：**{row['現價']}**
+                        - 買進區：**{row['買進區下緣']} ~ {row['買進區上緣']}**
+                        - 停損：**{row['停損價']}**
+                        - 停利：**{row['停利價']}**
+                        - 建議股數：**{row['建議股數']}**
+                        - 評分：**{row['評分']}**
+                        """
+                    )
 
             st.subheader("💰 國泰手動下單面板")
             selected_symbol = st.selectbox("選擇下單標的", top3["股票"].tolist())
@@ -283,9 +286,10 @@ if scan_clicked:
 
             if st.button("推播下單摘要到 LINE"):
                 msg = (
-                    f"🏛️ V35.5 國泰手動下單摘要\n"
+                    f"🏛️ V35.6 國泰手動下單摘要\n"
                     f"市場：{selected_row['市場']}\n"
                     f"標的：{selected_symbol}\n"
+                    f"訊號：{selected_row['訊號']}\n"
                     f"操作：{order_action}\n"
                     f"價格：{order_price}\n"
                     f"股數：{order_qty}\n"
@@ -299,10 +303,10 @@ if scan_clicked:
                     st.warning(line_msg)
 
             if ENABLE_LINE:
-                msg_lines = ["🔥 V35.5 今日最強3檔"]
+                msg_lines = ["🚦 V35.6 今日最強3檔"]
                 for _, row in top3.iterrows():
                     msg_lines.append(
-                        f"{row['市場']} | {row['股票']} | {row['狀態']} | 現價:{row['現價']} | 停損:{row['停損價']} | 停利:{row['停利價']}"
+                        f"{row['市場']} | {row['股票']} | {row['訊號']} | 現價:{row['現價']} | 停損:{row['停損價']} | 停利:{row['停利價']}"
                     )
                 push_line("\n".join(msg_lines))
 
