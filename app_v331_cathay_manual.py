@@ -6,9 +6,38 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 
-st.set_page_config(page_title="V36.4 建倉優先級版", layout="wide")
+st.set_page_config(page_title="V36.5 監控提醒強化版", layout="wide")
 
 WATCHLIST_FILE = "watchlist_memory.json"
+
+# =========================
+# 樣式
+# =========================
+st.markdown("""
+<style>
+.card {
+    padding: 16px;
+    border-radius: 16px;
+    margin-bottom: 12px;
+    border: 1px solid rgba(255,255,255,0.08);
+}
+.card-a { background: rgba(22, 163, 74, 0.12); }
+.card-b { background: rgba(234, 179, 8, 0.12); }
+.card-c { background: rgba(220, 38, 38, 0.12); }
+.tag {
+    display: inline-block;
+    padding: 4px 10px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 700;
+    margin-right: 6px;
+}
+.tag-green { background: #166534; color: white; }
+.tag-yellow { background: #a16207; color: white; }
+.tag-red { background: #991b1b; color: white; }
+.small-muted { color: #9CA3AF; font-size: 12px; }
+</style>
+""", unsafe_allow_html=True)
 
 # =========================
 # LINE 設定
@@ -329,8 +358,8 @@ if "only_tradeable" not in st.session_state:
 # =========================
 # UI
 # =========================
-st.title("🛡️ V36.4 建倉優先級版")
-st.caption("監控清單 + 自動篩選器｜飆股雷達分數｜建倉優先級｜國泰手動下單")
+st.title("🛡️ V36.5 監控提醒強化版")
+st.caption("A/B/C 級建倉卡片｜提醒色彩強化｜國泰手動下單｜LINE通知")
 
 st.subheader("📌 監控清單")
 watchlist = st.text_input("輸入股票（逗號分隔）", value=st.session_state.watchlist)
@@ -376,7 +405,7 @@ scan_us_auto = m3.button("美股自動篩選")
 test_line_clicked = m4.button("測試 LINE 推播")
 
 if test_line_clicked:
-    ok, msg = push_line("V36.4 測試推播成功")
+    ok, msg = push_line("V36.5 測試推播成功")
     if ok:
         st.success(msg)
     else:
@@ -436,9 +465,49 @@ if symbols_to_scan:
             st.info("目前沒有適合優先建倉的標的")
 
         top3 = priority_df.head(3)
+
         if not top3.empty:
-            st.subheader("🎯 今日最強3檔")
-            st.dataframe(top3.drop(columns=["優先排序"]), use_container_width=True)
+            st.subheader("🎯 今日優先建倉 Top 3")
+
+            cols = st.columns(min(3, len(top3)))
+            for i, (_, row) in enumerate(top3.iterrows()):
+                with cols[i]:
+                    priority = row["建倉優先級"]
+                    card_class = "card-a" if priority.startswith("A") else ("card-b" if priority.startswith("B") else "card-c")
+                    tag_class = "tag-green" if priority.startswith("A") else ("tag-yellow" if priority.startswith("B") else "tag-red")
+
+                    st.markdown(
+                        f"""
+                        <div class="card {card_class}">
+                            <div class="tag {tag_class}">{priority}</div>
+                            <h4>{row['股票']}</h4>
+                            <p><b>市場：</b>{row['市場']}</p>
+                            <p><b>訊號：</b>{row['訊號']}</p>
+                            <p><b>提醒：</b>{row['提醒']}</p>
+                            <p><b>現價：</b>{row['現價']}</p>
+                            <p><b>買進區：</b>{row['買進區下緣']} ~ {row['買進區上緣']}</p>
+                            <p><b>停損：</b>{row['停損價']}</p>
+                            <p><b>停利：</b>{row['停利價']}</p>
+                            <p><b>建議股數：</b>{row['建議股數']}</p>
+                            <p class="small-muted">{row['策略標記']}</p>
+                        </div>
+                        """,
+                        unsafe_allow_html=True
+                    )
+
+            if st.button("推播 A級 / 優先名單到 LINE"):
+                a_list = priority_df[priority_df["建倉優先級"] == "A級：可優先建倉"]
+                source_df = a_list if not a_list.empty else top3
+                msg_lines = ["🚦 V36.5 今日優先建倉名單"]
+                for _, row in source_df.iterrows():
+                    msg_lines.append(
+                        f"{row['股票']} | {row['建倉優先級']} | {row['訊號']} | 現價:{row['現價']} | 停損:{row['停損價']} | 停利:{row['停利價']}"
+                    )
+                ok, msg = push_line("\n".join(msg_lines))
+                if ok:
+                    st.success("已推播到 LINE")
+                else:
+                    st.warning(msg)
 
             st.subheader("💰 國泰手動下單面板")
             selected_symbol = st.selectbox("選擇下單標的", top3["股票"].tolist())
@@ -463,7 +532,7 @@ if symbols_to_scan:
 
             if st.button("推播下單摘要到 LINE"):
                 msg = (
-                    f"🏛️ V36.4 國泰手動下單摘要\n"
+                    f"🏛️ V36.5 國泰手動下單摘要\n"
                     f"市場：{selected_row['市場']}\n"
                     f"標的：{selected_symbol}\n"
                     f"建倉優先級：{selected_row['建倉優先級']}\n"
