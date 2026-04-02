@@ -6,15 +6,20 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 
-st.set_page_config(page_title="V36.5 監控提醒強化版", layout="wide")
+st.set_page_config(page_title="V36.8 雙面板進階版", layout="wide")
 
 WATCHLIST_FILE = "watchlist_memory.json"
+HOLDINGS_FILE = "holdings_memory.json"
 
 # =========================
 # 樣式
 # =========================
 st.markdown("""
 <style>
+.block-container {
+    padding-top: 1.2rem;
+    padding-bottom: 1rem;
+}
 .card {
     padding: 16px;
     border-radius: 16px;
@@ -24,6 +29,15 @@ st.markdown("""
 .card-a { background: rgba(22, 163, 74, 0.12); }
 .card-b { background: rgba(234, 179, 8, 0.12); }
 .card-c { background: rgba(220, 38, 38, 0.12); }
+
+.panel {
+    background: rgba(255,255,255,0.02);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 18px;
+    padding: 14px;
+    min-height: 200px;
+}
+
 .tag {
     display: inline-block;
     padding: 4px 10px;
@@ -31,11 +45,27 @@ st.markdown("""
     font-size: 12px;
     font-weight: 700;
     margin-right: 6px;
+    margin-bottom: 6px;
 }
 .tag-green { background: #166534; color: white; }
 .tag-yellow { background: #a16207; color: white; }
 .tag-red { background: #991b1b; color: white; }
-.small-muted { color: #9CA3AF; font-size: 12px; }
+.tag-blue { background: #1d4ed8; color: white; }
+
+.small-muted {
+    color: #9CA3AF;
+    font-size: 12px;
+}
+
+.big-number {
+    font-size: 22px;
+    font-weight: 800;
+}
+
+hr {
+    margin-top: 1rem;
+    margin-bottom: 1rem;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -85,7 +115,7 @@ def push_line(text: str):
         return False, f"LINE 推播例外：{e}"
 
 # =========================
-# watchlist 記憶
+# 記憶功能
 # =========================
 def load_watchlist_memory(default_value: str) -> str:
     try:
@@ -104,8 +134,28 @@ def save_watchlist_memory(watchlist: str):
     except Exception:
         pass
 
+def load_holdings():
+    default_rows = [{"股票": "", "股數": 0, "均價": 0.0} for _ in range(20)]
+    try:
+        if os.path.exists(HOLDINGS_FILE):
+            with open(HOLDINGS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                rows = data.get("holdings", default_rows)
+                rows = rows[:20] + [{"股票": "", "股數": 0, "均價": 0.0}] * max(0, 20 - len(rows))
+                return rows
+    except Exception:
+        pass
+    return default_rows
+
+def save_holdings(rows):
+    try:
+        with open(HOLDINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump({"holdings": rows}, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
 # =========================
-# 工具
+# 工具函式
 # =========================
 def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
@@ -124,7 +174,7 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 def fetch_symbol_data(symbol: str, period: str = "1y") -> tuple[pd.DataFrame, str, str]:
-    symbol = symbol.strip().upper()
+    symbol = str(symbol).strip().upper()
 
     if symbol.isdigit():
         for suffix in [".TW", ".TWO"]:
@@ -333,6 +383,84 @@ def calc_radar_signal(df: pd.DataFrame, symbol: str, market: str, capital: float
         "備註": " / ".join(notes[:5]) if notes else "資料有限"
     }
 
+def monitor_holdings(holdings_rows, capital, risk_percent):
+    results = []
+
+    for row in holdings_rows:
+        symbol = str(row.get("股票", "")).strip().upper()
+        qty = float(row.get("股數", 0) or 0)
+        avg_cost = float(row.get("均價", 0) or 0)
+
+        if not symbol or qty <= 0 or avg_cost <= 0:
+            continue
+
+        df, real_symbol, market = fetch_symbol_data(symbol)
+
+        if df.empty:
+            results.append({
+                "股票": symbol,
+                "市場": "未知",
+                "股數": qty,
+                "均價": avg_cost,
+                "現價": None,
+                "損益%": None,
+                "訊號": "查無資料",
+                "提醒": "無法抓取行情",
+                "建議": "請確認代碼",
+                "停損價": None,
+                "停利價": None,
+                "建倉優先級": "-"
+            })
+            continue
+
+        try:
+            signal_row = calc_radar_signal(df, real_symbol, market, capital, risk_percent)
+            current_price = float(signal_row["現價"])
+            pnl_pct = round((current_price / avg_cost - 1) * 100, 2)
+
+            if current_price <= signal_row["停損價"]:
+                advice = "🚨 停損警戒"
+            elif pnl_pct >= 15:
+                advice = "🎯 停利觀察"
+            elif signal_row["建倉優先級"].startswith("A"):
+                advice = "✅ 可續抱 / 強勢"
+            elif signal_row["訊號"] == "🟡 觀望":
+                advice = "⏳ 續抱觀察"
+            else:
+                advice = "⚠️ 考慮減碼"
+
+            results.append({
+                "股票": real_symbol,
+                "市場": market,
+                "股數": qty,
+                "均價": round(avg_cost, 2),
+                "現價": round(current_price, 2),
+                "損益%": pnl_pct,
+                "訊號": signal_row["訊號"],
+                "提醒": signal_row["提醒"],
+                "建議": advice,
+                "停損價": signal_row["停損價"],
+                "停利價": signal_row["停利價"],
+                "建倉優先級": signal_row["建倉優先級"]
+            })
+        except Exception:
+            results.append({
+                "股票": symbol,
+                "市場": market,
+                "股數": qty,
+                "均價": avg_cost,
+                "現價": None,
+                "損益%": None,
+                "訊號": "錯誤",
+                "提醒": "計算失敗",
+                "建議": "請稍後再試",
+                "停損價": None,
+                "停利價": None,
+                "建倉優先級": "-"
+            })
+
+    return pd.DataFrame(results)
+
 # =========================
 # 候選池
 # =========================
@@ -355,16 +483,40 @@ if "risk_percent" not in st.session_state:
 if "only_tradeable" not in st.session_state:
     st.session_state.only_tradeable = False
 
+if "holdings" not in st.session_state:
+    st.session_state.holdings = load_holdings()
+
 # =========================
 # UI
 # =========================
-st.title("🛡️ V36.5 監控提醒強化版")
-st.caption("A/B/C 級建倉卡片｜提醒色彩強化｜國泰手動下單｜LINE通知")
+st.title("🛡️ V36.8 雙面板進階版")
+st.caption("庫存 + 候選股雙面板｜監控清單記憶｜A/B/C 級建倉卡片｜國泰手動下單")
 
 st.subheader("📌 監控清單")
 watchlist = st.text_input("輸入股票（逗號分隔）", value=st.session_state.watchlist)
 save_watchlist_memory(watchlist)
 st.session_state.watchlist = watchlist
+
+st.subheader("📦 20檔現有庫存列表")
+holdings_df = pd.DataFrame(st.session_state.holdings)
+edited_holdings = st.data_editor(
+    holdings_df,
+    num_rows="fixed",
+    use_container_width=True,
+    column_config={
+        "股票": st.column_config.TextColumn("股票代碼"),
+        "股數": st.column_config.NumberColumn("股數", min_value=0, step=1),
+        "均價": st.column_config.NumberColumn("均價", min_value=0.0, step=0.1),
+    },
+    key="holdings_editor"
+)
+
+save_col1, save_col2 = st.columns([1, 5])
+if save_col1.button("💾 儲存庫存列表"):
+    rows = edited_holdings.to_dict(orient="records")
+    st.session_state.holdings = rows
+    save_holdings(rows)
+    st.success("已儲存 20 檔庫存列表")
 
 st.subheader("⚙️ 資金模式")
 c1, c2, c3, c4 = st.columns(4)
@@ -398,14 +550,15 @@ st.session_state.risk_percent = risk_percent
 st.session_state.only_tradeable = only_tradeable
 
 st.subheader("🔎 篩選模式")
-m1, m2, m3, m4 = st.columns(4)
+m1, m2, m3, m4, m5 = st.columns(5)
 scan_watchlist = m1.button("掃描監控清單")
 scan_tw_auto = m2.button("台股自動篩選")
 scan_us_auto = m3.button("美股自動篩選")
-test_line_clicked = m4.button("測試 LINE 推播")
+scan_holdings_btn = m4.button("監控現有庫存")
+test_line_clicked = m5.button("測試 LINE 推播")
 
 if test_line_clicked:
-    ok, msg = push_line("V36.5 測試推播成功")
+    ok, msg = push_line("V36.8 測試推播成功")
     if ok:
         st.success(msg)
     else:
@@ -436,40 +589,76 @@ if symbols_to_scan:
         except Exception:
             failed_symbols.append(s)
 
+holdings_result_df = pd.DataFrame()
+if scan_holdings_btn or (st.session_state.holdings and len(st.session_state.holdings) > 0):
+    holdings_result_df = monitor_holdings(st.session_state.holdings, capital, risk_percent)
+
+# =========================
+# 雙面板
+# =========================
+left_col, right_col = st.columns([1, 1])
+
+with left_col:
+    st.markdown('<div class="panel">', unsafe_allow_html=True)
+    st.subheader("📦 現有庫存監控")
+
+    if not holdings_result_df.empty:
+        st.dataframe(holdings_result_df, use_container_width=True)
+
+        warning_df = holdings_result_df[
+            holdings_result_df["建議"].isin(["🚨 停損警戒", "🎯 停利觀察"])
+        ]
+
+        if not warning_df.empty:
+            st.markdown("### 🚨 庫存重點提醒")
+            for _, r in warning_df.iterrows():
+                st.write(f"{r['股票']}｜損益 {r['損益%']}%｜{r['建議']}")
+
+            if ENABLE_LINE and st.button("推播庫存警戒到 LINE"):
+                msg_lines = ["📦 V36.8 庫存警戒提醒"]
+                for _, r in warning_df.iterrows():
+                    msg_lines.append(
+                        f"{r['股票']} | 損益:{r['損益%']}% | 建議:{r['建議']} | 現價:{r['現價']}"
+                    )
+                ok, msg = push_line("\n".join(msg_lines))
+                if ok:
+                    st.success("已推播庫存警戒")
+                else:
+                    st.warning(msg)
+    else:
+        st.info("目前沒有有效庫存資料")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+with right_col:
+    st.markdown('<div class="panel">', unsafe_allow_html=True)
+    st.subheader("🎯 候選股 / 新建倉")
+
     if results:
         df_show = pd.DataFrame(results)
 
         if only_tradeable:
             df_show = df_show[df_show["訊號"] == "🟢 可打"]
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("🟢 可打", int((df_show["訊號"] == "🟢 可打").sum()))
-        c2.metric("🟡 觀望", int((df_show["訊號"] == "🟡 觀望").sum()))
-        c3.metric("🔴 避開", int((df_show["訊號"] == "🔴 避開").sum()))
-
-        st.subheader("📊 掃描結果")
         st.dataframe(df_show, use_container_width=True)
 
         priority_df = df_show[df_show["訊號"] == "🟢 可打"].copy()
-        priority_df["優先排序"] = priority_df["建倉優先級"].map({
-            "A級：可優先建倉": 1,
-            "B級：觀察等確認": 2,
-            "C級：先避開": 3
-        })
-        priority_df = priority_df.sort_values(["優先排序", "雷達分數"], ascending=[True, False])
 
-        st.subheader("🔥 建倉優先名單")
         if not priority_df.empty:
+            priority_df["優先排序"] = priority_df["建倉優先級"].map({
+                "A級：可優先建倉": 1,
+                "B級：觀察等確認": 2,
+                "C級：先避開": 3
+            })
+            priority_df = priority_df.sort_values(["優先排序", "雷達分數"], ascending=[True, False])
+
+            st.markdown("### 🔥 建倉優先名單")
             st.dataframe(priority_df.drop(columns=["優先排序"]), use_container_width=True)
-        else:
-            st.info("目前沒有適合優先建倉的標的")
 
-        top3 = priority_df.head(3)
+            top3 = priority_df.head(3)
 
-        if not top3.empty:
-            st.subheader("🎯 今日優先建倉 Top 3")
-
+            st.markdown("### 🏆 今日候選 Top 3")
             cols = st.columns(min(3, len(top3)))
+
             for i, (_, row) in enumerate(top3.iterrows()):
                 with cols[i]:
                     priority = row["建倉優先級"]
@@ -480,8 +669,8 @@ if symbols_to_scan:
                         f"""
                         <div class="card {card_class}">
                             <div class="tag {tag_class}">{priority}</div>
-                            <h4>{row['股票']}</h4>
-                            <p><b>市場：</b>{row['市場']}</p>
+                            <div class="tag tag-blue">{row['市場']}</div>
+                            <div class="big-number">{row['股票']}</div>
                             <p><b>訊號：</b>{row['訊號']}</p>
                             <p><b>提醒：</b>{row['提醒']}</p>
                             <p><b>現價：</b>{row['現價']}</p>
@@ -495,10 +684,10 @@ if symbols_to_scan:
                         unsafe_allow_html=True
                     )
 
-            if st.button("推播 A級 / 優先名單到 LINE"):
+            if ENABLE_LINE and st.button("推播 A級 / 優先名單到 LINE"):
                 a_list = priority_df[priority_df["建倉優先級"] == "A級：可優先建倉"]
                 source_df = a_list if not a_list.empty else top3
-                msg_lines = ["🚦 V36.5 今日優先建倉名單"]
+                msg_lines = ["🚦 V36.8 今日優先建倉名單"]
                 for _, row in source_df.iterrows():
                     msg_lines.append(
                         f"{row['股票']} | {row['建倉優先級']} | {row['訊號']} | 現價:{row['現價']} | 停損:{row['停損價']} | 停利:{row['停利價']}"
@@ -509,13 +698,13 @@ if symbols_to_scan:
                 else:
                     st.warning(msg)
 
-            st.subheader("💰 國泰手動下單面板")
-            selected_symbol = st.selectbox("選擇下單標的", top3["股票"].tolist())
+            st.markdown("### 💰 國泰手動下單面板")
+            selected_symbol = st.selectbox("選擇候選標的", top3["股票"].tolist(), key="candidate_select")
             selected_row = top3[top3["股票"] == selected_symbol].iloc[0]
 
-            order_price = st.number_input("下單價格", value=float(selected_row["現價"]), step=0.1)
-            order_qty = st.number_input("下單股數", value=max(int(selected_row["建議股數"]), 1), step=1, min_value=1)
-            order_action = st.selectbox("操作", ["BUY 買進", "SELL 賣出", "REDUCE 減碼"])
+            order_price = st.number_input("下單價格", value=float(selected_row["現價"]), step=0.1, key="candidate_price")
+            order_qty = st.number_input("下單股數", value=max(int(selected_row["建議股數"]), 1), step=1, min_value=1, key="candidate_qty")
+            order_action = st.selectbox("操作", ["BUY 買進", "SELL 賣出", "REDUCE 減碼"], key="candidate_action")
 
             st.markdown("### 🧾 下單摘要")
             st.write(f"市場：{selected_row['市場']}")
@@ -530,9 +719,9 @@ if symbols_to_scan:
             st.write(f"停損：{selected_row['停損價']}")
             st.write(f"停利：{selected_row['停利價']}")
 
-            if st.button("推播下單摘要到 LINE"):
+            if ENABLE_LINE and st.button("推播候選下單摘要到 LINE", key="candidate_line_push"):
                 msg = (
-                    f"🏛️ V36.5 國泰手動下單摘要\n"
+                    f"🏛️ V36.8 候選股下單摘要\n"
                     f"市場：{selected_row['市場']}\n"
                     f"標的：{selected_symbol}\n"
                     f"建倉優先級：{selected_row['建倉優先級']}\n"
@@ -547,13 +736,18 @@ if symbols_to_scan:
                 )
                 ok, line_msg = push_line(msg)
                 if ok:
-                    st.success("已推播到 LINE")
+                    st.success("已推播候選股下單摘要")
                 else:
                     st.warning(line_msg)
-
+        else:
+            st.info("目前沒有可建倉候選股")
     else:
-        st.warning("查無可用資料。")
+        st.info("請先進行掃描")
+    st.markdown('</div>', unsafe_allow_html=True)
 
-    if failed_symbols:
-        st.subheader("⚠️ 無法取得資料的股票")
-        st.write(", ".join(failed_symbols))
+# =========================
+# 底部錯誤區
+# =========================
+if failed_symbols:
+    st.subheader("⚠️ 無法取得資料的股票")
+    st.write(", ".join(failed_symbols))
