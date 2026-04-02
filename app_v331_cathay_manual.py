@@ -13,7 +13,12 @@ capital = st.number_input("總資金", min_value=10000, value=100000, step=10000
 risk_percent = st.slider("單筆風險比例 (%)", min_value=0.5, max_value=5.0, value=1.0, step=0.5)
 
 if st.button("開始掃描"):
-    symbols = [x.strip() for x in watchlist.split(",") if x.strip()]
+    symbols = []
+for x in watchlist.split(","):
+    s = x.strip().upper()
+    if s.isdigit():   # 台股
+        s = s + ".TW"
+    symbols.append(s)
     results = []
 
     for s in symbols:
