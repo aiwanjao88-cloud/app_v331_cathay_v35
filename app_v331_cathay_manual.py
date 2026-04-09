@@ -1,764 +1,592 @@
-import os
-import re
 import json
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+
+import pandas as pd
+import plotly.graph_objects as go
 import requests
 import streamlit as st
 import yfinance as yf
-import pandas as pd
-import numpy as np
 
-st.set_page_config(page_title="V37 自動分組看板版", layout="wide")
-
-WATCHLIST_FILE = "watchlist_memory.json"
-HOLDINGS_FILE = "holdings_memory.json"
+st.set_page_config(page_title='V38.1 手機版操盤系統', page_icon='📱', layout='wide')
 
 # =========================
-# 樣式
+# 預設值
 # =========================
-st.markdown("""
-<style>
-.block-container {
-    padding-top: 1.2rem;
-    padding-bottom: 1rem;
-}
-.card {
-    padding: 16px;
-    border-radius: 16px;
-    margin-bottom: 12px;
-    border: 1px solid rgba(255,255,255,0.08);
-}
-.card-a { background: rgba(22, 163, 74, 0.12); }
-.card-b { background: rgba(234, 179, 8, 0.12); }
-.card-c { background: rgba(220, 38, 38, 0.12); }
-
-.panel {
-    background: rgba(255,255,255,0.02);
-    border: 1px solid rgba(255,255,255,0.08);
-    border-radius: 18px;
-    padding: 14px;
-    min-height: 220px;
-    margin-bottom: 12px;
-}
-
-.tag {
-    display: inline-block;
-    padding: 4px 10px;
-    border-radius: 999px;
-    font-size: 12px;
-    font-weight: 700;
-    margin-right: 6px;
-    margin-bottom: 6px;
-}
-.tag-green { background: #166534; color: white; }
-.tag-yellow { background: #a16207; color: white; }
-.tag-red { background: #991b1b; color: white; }
-.tag-blue { background: #1d4ed8; color: white; }
-
-.small-muted {
-    color: #9CA3AF;
-    font-size: 12px;
-}
-.big-number {
-    font-size: 22px;
-    font-weight: 800;
-}
-</style>
-""", unsafe_allow_html=True)
-
-# =========================
-# LINE 設定
-# =========================
-def get_secret(name: str, default: str = "") -> str:
-    try:
-        if name in st.secrets:
-            return str(st.secrets[name]).strip()
-    except Exception:
-        pass
-    return os.getenv(name, default).strip()
-
-LINE_TOKEN = get_secret("LINE_TOKEN")
-LINE_USER_ID = get_secret("LINE_USER_ID")
-ENABLE_LINE = bool(LINE_TOKEN and LINE_USER_ID)
-
-def push_line(text: str):
-    if not ENABLE_LINE:
-        return False, "未設定 LINE_TOKEN / LINE_USER_ID"
-
-    if any(ord(ch) > 127 for ch in LINE_TOKEN) or any(ord(ch) > 127 for ch in LINE_USER_ID):
-        return False, "LINE_TOKEN / LINE_USER_ID 內含非英文字符"
-
-    headers = {
-        "Content-Type": "application/json; charset=utf-8",
-        "Authorization": f"Bearer {LINE_TOKEN}"
-    }
-
-    payload = {
-        "to": LINE_USER_ID,
-        "messages": [{"type": "text", "text": text}]
-    }
-
-    try:
-        r = requests.post(
-            "https://api.line.me/v2/bot/message/push",
-            headers=headers,
-            json=payload,
-            timeout=10
-        )
-        if 200 <= r.status_code < 300:
-            return True, "LINE 推播成功"
-        return False, f"LINE 推播失敗：{r.status_code}"
-    except Exception as e:
-        return False, f"LINE 推播例外：{e}"
-
-# =========================
-# 記憶
-# =========================
-def load_watchlist_memory(default_value: str) -> str:
-    try:
-        if os.path.exists(WATCHLIST_FILE):
-            with open(WATCHLIST_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                return data.get("watchlist", default_value)
-    except Exception:
-        pass
-    return default_value
-
-def save_watchlist_memory(watchlist: str):
-    try:
-        with open(WATCHLIST_FILE, "w", encoding="utf-8") as f:
-            json.dump({"watchlist": watchlist}, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-
-def load_holdings():
-    default_rows = [{"股票": "", "股數": 0, "均價": 0.0} for _ in range(20)]
-    try:
-        if os.path.exists(HOLDINGS_FILE):
-            with open(HOLDINGS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                rows = data.get("holdings", default_rows)
-                rows = rows[:20] + [{"股票": "", "股數": 0, "均價": 0.0}] * max(0, 20 - len(rows))
-                return rows
-    except Exception:
-        pass
-    return default_rows
-
-def save_holdings(rows):
-    try:
-        with open(HOLDINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump({"holdings": rows}, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+TW_DEFAULTS = ['2330.TW', '2317.TW', '2382.TW', '2454.TW', '2308.TW', '2603.TW']
+US_DEFAULTS = ['NVDA', 'TSM', 'QQQM', 'SMH', 'AVGO', 'MSFT']
+DEFAULT_CAPITAL = 200000
+DEFAULT_MAX_POSITIONS = 2
+DEFAULT_SINGLE_POSITION_PCT = 0.30
+DEFAULT_STOP_LOSS_PCT = 0.05
+DEFAULT_TAKE_PROFIT_PCT = 0.10
+DEFAULT_DAILY_LOSS_STOP_PCT = 0.05
 
 # =========================
 # 工具函式
 # =========================
-def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
+def now_str() -> str:
+    return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+
+def parse_symbols(raw: str) -> List[str]:
+    items = []
+    for x in raw.replace('\n', ',').split(','):
+        s = x.strip().upper()
+        if s:
+            items.append(s)
+    seen = set()
+    out = []
+    for s in items:
+        if s not in seen:
+            out.append(s)
+            seen.add(s)
+    return out
+
+
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, pd.NA)
+    return (100 - (100 / (1 + rs))).fillna(0)
+
+
+@st.cache_data(ttl=300)
+def fetch_price_history(symbol: str, period: str = '6mo') -> pd.DataFrame:
+    df = yf.download(symbol, period=period, interval='1d', auto_adjust=False, progress=False)
     if df is None or df.empty:
         return pd.DataFrame()
 
-    out = df.copy()
-    if isinstance(out.columns, pd.MultiIndex):
-        out.columns = out.columns.get_level_values(0)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[0] for c in df.columns]
 
-    required_cols = ["Open", "High", "Low", "Close", "Volume"]
-    for c in required_cols:
-        if c not in out.columns:
-            return pd.DataFrame()
+    keep = [c for c in ['Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume'] if c in df.columns]
+    df = df[keep].copy()
 
-    out = out.dropna(subset=["Close"])
+    if 'Close' not in df.columns:
+        return pd.DataFrame()
+
+    df['MA5'] = df['Close'].rolling(5).mean()
+    df['MA20'] = df['Close'].rolling(20).mean()
+    df['MA60'] = df['Close'].rolling(60).mean()
+    df['VOL20'] = df['Volume'].rolling(20).mean() if 'Volume' in df.columns else 0
+    df['RSI14'] = rsi(df['Close'], 14)
+    df['Prev20High'] = df['High'].rolling(20).max().shift(1)
+    df['Signal_Breakout'] = (df['Close'] > df['Prev20High']) & (df['Volume'] > df['VOL20'])
+    df['Signal_Trend'] = (df['Close'] > df['MA5']) & (df['MA5'] > df['MA60'])
+    df['Signal_Pullback'] = (df['Low'] <= df['MA5']) & (df['Close'] > df['MA5']) & (df['MA5'] > df['MA60'])
+    return df.dropna(how='all')
+
+
+def calc_signal(df: pd.DataFrame, stop_loss_pct: float, take_profit_pct: float) -> Dict[str, object]:
+    if df.empty or len(df) < 65:
+        return {
+            'signal': '資料不足',
+            'entry': None,
+            'stop': None,
+            'tp1': None,
+            'score': -999,
+            'reason': '資料不足'
+        }
+
+    last = df.iloc[-1]
+    close = float(last['Close'])
+    ma5 = float(last['MA5']) if pd.notna(last['MA5']) else None
+    ma60 = float(last['MA60']) if pd.notna(last['MA60']) else None
+    vol = float(last['Volume']) if pd.notna(last['Volume']) else 0
+    vol20 = float(last['VOL20']) if pd.notna(last['VOL20']) else 0
+    prev20h = float(last['Prev20High']) if pd.notna(last['Prev20High']) else None
+    r = float(last['RSI14']) if pd.notna(last['RSI14']) else 0
+
+    trend_ok = ma5 is not None and ma60 is not None and close > ma5 > ma60
+    breakout = bool(last['Signal_Breakout'])
+    pullback = bool(last['Signal_Pullback'])
+
+    score = 0
+    reasons = []
+
+    if trend_ok:
+        score += 40
+        reasons.append('5MA>60MA 且收盤站上5MA')
+
+    if breakout:
+        score += 35
+        reasons.append('突破20日高點且量增')
+
+    if pullback:
+        score += 15
+        reasons.append('回踩5MA承接')
+
+    if vol20 > 0 and vol > vol20:
+        score += 5
+
+    if 50 <= r <= 78:
+        score += 10
+        reasons.append(f'RSI14={r:.1f}')
+    elif r > 80:
+        score -= 5
+        reasons.append(f'RSI14={r:.1f} 偏熱')
+
+    signal = '觀察'
+    entry = None
+
+    if breakout and trend_ok:
+        signal = '突破買進'
+        entry = round(max(close, prev20h or close), 2)
+    elif pullback and trend_ok:
+        signal = '5MA承接'
+        entry = round(ma5, 2) if ma5 else round(close, 2)
+    elif trend_ok:
+        signal = '趨勢續抱'
+        entry = round(close, 2)
+    else:
+        score -= 15
+        reasons.append('未形成多頭趨勢')
+
+    return {
+        'signal': signal,
+        'entry': entry,
+        'stop': round(close * (1 - stop_loss_pct), 2),
+        'tp1': round(close * (1 + take_profit_pct), 2),
+        'score': score,
+        'reason': '；'.join(reasons),
+        'close': round(close, 2),
+    }
+
+
+def recommend_qty(capital: float, alloc_pct: float, entry: Optional[float], market: str) -> Tuple[float, int]:
+    budget = capital * alloc_pct
+    if not entry or entry <= 0:
+        return budget, 0
+
+    if market == '台股':
+        return budget, int(budget // (entry * 1000))
+    return budget, int(budget // entry)
+
+
+def make_order_df(top_df: pd.DataFrame, capital: float, alloc_pct: float) -> pd.DataFrame:
+    rows = []
+    for _, row in top_df.iterrows():
+        budget, qty = recommend_qty(capital, alloc_pct, row['建議進場價'], row['市場'])
+        rows.append({
+            '市場': row['市場'],
+            '代碼': row['代碼'],
+            '訊號': row['訊號'],
+            '委託類型': '現股/限價' if row['市場'] == '台股' else '複委託/限價',
+            '建議進場價': row['建議進場價'],
+            '停損價': row['停損價'],
+            '第一停利價': row['第一停利價'],
+            '配置金額': round(budget, 2),
+            '建議數量': f'{qty} 張' if row['市場'] == '台股' else f'{qty} 股',
+        })
+    return pd.DataFrame(rows)
+
+
+def line_enabled() -> bool:
+    return 'line_channel_access_token' in st.secrets and 'line_to' in st.secrets
+
+
+def send_line(text: str) -> Tuple[bool, str]:
+    if not line_enabled():
+        return False, '尚未設定 line_channel_access_token / line_to'
+
+    url = 'https://api.line.me/v2/bot/message/push'
+    headers = {
+        'Authorization': f"Bearer {st.secrets['line_channel_access_token']}",
+        'Content-Type': 'application/json',
+    }
+    payload = {
+        'to': st.secrets['line_to'],
+        'messages': [{'type': 'text', 'text': text[:5000]}]
+    }
+
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=20)
+        if 200 <= r.status_code < 300:
+            return True, 'LINE 推播成功'
+        return False, f'推播失敗：HTTP {r.status_code} / {r.text[:180]}'
+    except Exception as e:
+        return False, f'推播失敗：{e}'
+
+
+def build_alert_text(top_df: pd.DataFrame) -> str:
+    lines = [f'V38.1 手機版訊號 {now_str()}']
+    if top_df.empty:
+        lines.append('目前沒有可用訊號。')
+        return '\n'.join(lines)
+
+    for _, row in top_df.iterrows():
+        lines.append(
+            f"{row['代碼']}｜{row['訊號']}｜進場 {row['建議進場價']}｜停損 {row['停損價']}｜停利 {row['第一停利價']}"
+        )
+    return '\n'.join(lines)
+
+
+def draw_chart(df: pd.DataFrame, symbol: str):
+    if df.empty:
+        st.warning(f'{symbol} 無資料')
+        return
+
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(
+        x=df.index,
+        open=df['Open'],
+        high=df['High'],
+        low=df['Low'],
+        close=df['Close'],
+        name='K線'
+    ))
+    fig.add_trace(go.Scatter(x=df.index, y=df['MA5'], name='MA5'))
+    fig.add_trace(go.Scatter(x=df.index, y=df['MA20'], name='MA20'))
+    fig.add_trace(go.Scatter(x=df.index, y=df['MA60'], name='MA60'))
+    fig.update_layout(height=460, xaxis_rangeslider_visible=False, margin=dict(l=8, r=8, t=28, b=8))
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def init_state():
+    st.session_state.setdefault('scan_df', pd.DataFrame())
+    st.session_state.setdefault('top3_df', pd.DataFrame())
+    st.session_state.setdefault('order_df', pd.DataFrame())
+    st.session_state.setdefault('df_map', {})
+    st.session_state.setdefault('positions', [])
+    st.session_state.setdefault('trade_log', [])
+
+
+def save_positions(rows: List[Dict]):
+    st.session_state['positions'] = rows
+
+
+def save_trade_log(rows: List[Dict]):
+    st.session_state['trade_log'] = rows
+
+
+def positions_df() -> pd.DataFrame:
+    rows = st.session_state.get('positions', [])
+    if rows:
+        return pd.DataFrame(rows)
+    return pd.DataFrame(columns=[
+        '市場', '代碼', '持有數量', '成本價', '目前價', '報酬率%', '停損價', '第一停利價', '狀態'
+    ])
+
+
+def trade_log_df() -> pd.DataFrame:
+    rows = st.session_state.get('trade_log', [])
+    if rows:
+        return pd.DataFrame(rows)
+    return pd.DataFrame(columns=[
+        '日期', '市場', '代碼', '動作', '價格', '數量', '備註'
+    ])
+
+
+def update_position_prices(df_map: Dict[str, pd.DataFrame]):
+    pos = positions_df()
+    if pos.empty:
+        return pos
+
+    out = pos.copy()
+    current_prices = []
+    returns = []
+    status = []
+
+    for _, row in out.iterrows():
+        symbol = row['代碼']
+        current = None
+        if symbol in df_map and not df_map[symbol].empty:
+            current = float(df_map[symbol]['Close'].iloc[-1])
+
+        current_prices.append(current)
+
+        cost = float(row['成本價']) if row['成本價'] not in [None, ''] else None
+        ret = ((current / cost) - 1) * 100 if current and cost else None
+        returns.append(round(ret, 2) if ret is not None else None)
+
+        stop = row['停損價']
+        tp1 = row['第一停利價']
+
+        s = '持有中'
+        if current and stop and current <= float(stop):
+            s = '觸發停損'
+        elif current and tp1 and current >= float(tp1):
+            s = '到達停利一'
+
+        status.append(s)
+
+    out['目前價'] = current_prices
+    out['報酬率%'] = returns
+    out['狀態'] = status
+    save_positions(out.fillna('').to_dict('records'))
     return out
 
-def is_tw_symbol(symbol: str) -> bool:
-    symbol = str(symbol).strip().upper()
-    return bool(re.fullmatch(r"\d{4,6}[A-Z]{0,2}", symbol))
 
-def fetch_symbol_data(symbol: str, period: str = "1y") -> tuple[pd.DataFrame, str, str]:
-    symbol = str(symbol).strip().upper()
-    clean_symbol = symbol.replace(".TW", "").replace(".TWO", "")
-
-    if is_tw_symbol(clean_symbol):
-        for suffix in [".TW", ".TWO"]:
-            real_symbol = clean_symbol + suffix
-            try:
-                df = yf.download(real_symbol, period=period, progress=False, auto_adjust=True)
-                df = normalize_df(df)
-                if not df.empty and len(df) >= 120:
-                    return df, real_symbol, "台股"
-            except Exception:
-                pass
-        return pd.DataFrame(), clean_symbol, "台股"
-
-    try:
-        df = yf.download(symbol, period=period, progress=False, auto_adjust=True)
-        df = normalize_df(df)
-        if not df.empty and len(df) >= 120:
-            return df, symbol, "美股"
-    except Exception:
-        pass
-
-    return pd.DataFrame(), symbol, "美股"
-
-def calc_kd(df: pd.DataFrame, n=9):
-    low_min = df["Low"].rolling(n).min()
-    high_max = df["High"].rolling(n).max()
-    rsv = (df["Close"] - low_min) / (high_max - low_min + 1e-9) * 100
-    k = rsv.ewm(com=2).mean()
-    d = k.ewm(com=2).mean()
-    return float(k.iloc[-1]), float(d.iloc[-1])
-
-def get_fundamental_data(symbol: str):
-    try:
-        tk = yf.Ticker(symbol)
-        info = tk.info if tk.info else {}
-    except Exception:
-        info = {}
-
-    return {
-        "pe": info.get("trailingPE", None),
-        "market_cap": info.get("marketCap", None),
-        "profit_margin": info.get("profitMargins", None),
-        "revenue_growth": info.get("revenueGrowth", None),
-        "earnings_growth": info.get("earningsGrowth", None),
-    }
-
-def get_priority_level(radar_score, price, buy_zone_low, buy_zone_high, latest_vol, avg_vol20, breakout_ok):
-    near_buy_zone = buy_zone_low <= price <= buy_zone_high
-    vol_ok = latest_vol > avg_vol20 * 1.3
-
-    if radar_score >= 80 and near_buy_zone and (vol_ok or breakout_ok):
-        return "A級：可優先建倉"
-    elif radar_score >= 65:
-        return "B級：觀察等確認"
-    return "C級：先避開"
-
-def calc_radar_signal(df: pd.DataFrame, symbol: str, market: str, capital: float, risk_percent: float):
-    close = df["Close"]
-    high = df["High"]
-    low = df["Low"]
-    vol = df["Volume"]
-
-    price = float(close.iloc[-1])
-    ma20 = float(close.rolling(20).mean().iloc[-1])
-    ma60 = float(close.rolling(60).mean().iloc[-1])
-
-    avg_vol20 = float(vol.rolling(20).mean().iloc[-1])
-    latest_vol = float(vol.iloc[-1])
-
-    tr1 = high - low
-    tr2 = (high - close.shift(1)).abs()
-    tr3 = (low - close.shift(1)).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    atr14 = float(tr.rolling(14).mean().iloc[-1])
-
-    k, d = calc_kd(df)
-
-    flagpole_return = (float(close.iloc[-1]) / float(close.iloc[-20]) - 1) * 100 if len(close) >= 20 else 0
-    recent_10_high = float(high.rolling(10).max().iloc[-2]) if len(high) >= 11 else float(high.max())
-    breakout_10 = price >= recent_10_high * 1.00
-    volume_breakout = latest_vol > avg_vol20 * 1.5
-    consolidation_ok = price >= ma20 * 0.98
-
-    f = get_fundamental_data(symbol)
-
-    fundamental_score = 0
-    notes = []
-    strategy_tags = []
-
-    if f["profit_margin"] is not None and f["profit_margin"] > 0:
-        fundamental_score += 15
-        notes.append("獲利能力正向")
-        strategy_tags.append("2益-獲利")
-
-    if f["revenue_growth"] is not None and f["revenue_growth"] > 0.10:
-        fundamental_score += 15
-        notes.append("營收雙位數成長")
-        strategy_tags.append("2益-高成長")
-
-    if f["earnings_growth"] is not None and f["earnings_growth"] > 0:
-        fundamental_score += 10
-        notes.append("EPS成長正向")
-        strategy_tags.append("2益-EPS")
-
-    if f["pe"] is not None and f["pe"] > 0 and f["pe"] < 15:
-        fundamental_score += 10
-        notes.append("本益比相對合理")
-
-    if f["market_cap"] is not None and f["market_cap"] > 3e9:
-        fundamental_score += 10
-        notes.append("規模/流動性較佳")
-
-    technical_score = 0
-
-    if latest_vol > avg_vol20 * 1.5:
-        technical_score += 20
-        notes.append("近期爆量")
-        strategy_tags.append("3新-新買盤")
-
-    if price > ma20 and ma20 > ma60:
-        technical_score += 20
-        notes.append("站上中長均線")
-
-    if k > d and k > 50:
-        technical_score += 10
-        notes.append("KD 黃金交叉偏強")
-
-    if k > 80:
-        technical_score += 10
-        notes.append("KD 高檔鈍化")
-
-    if breakout_10 and volume_breakout and consolidation_ok:
-        technical_score += 20
-        notes.append("帶量突破整理區")
-        strategy_tags.append("旗竿整理突破")
-
-    if flagpole_return > 15:
-        technical_score += 10
-        notes.append("旗竿動能明顯")
-        strategy_tags.append("旗竿原理")
-
-    radar_score = fundamental_score + technical_score
-
-    if radar_score >= 75:
-        signal = "🟢 可打"
-    elif radar_score >= 50:
-        signal = "🟡 觀望"
-    else:
-        signal = "🔴 避開"
-
-    buy_zone_low = round(ma20 * 0.99, 2)
-    buy_zone_high = round(ma20 * 1.01, 2)
-    stop_loss = round(ma20 - atr14, 2)
-    take_profit = round(price + (price - stop_loss) * 2, 2)
-
-    risk_amount = capital * (risk_percent / 100)
-    per_share_risk = max(price - stop_loss, 0.01)
-    suggested_shares = int(risk_amount / per_share_risk)
-
-    if buy_zone_low <= price <= buy_zone_high and signal == "🟢 可打":
-        alert = "✅ 接近買點"
-    elif price < stop_loss:
-        alert = "🚨 跌破停損"
-    elif price >= take_profit:
-        alert = "🎯 到達停利觀察"
-    elif signal == "🟢 可打":
-        alert = "👀 可列入建倉"
-    elif signal == "🟡 觀望":
-        alert = "⏳ 等待確認"
-    else:
-        alert = "⛔ 先避開"
-
-    priority = get_priority_level(
-        radar_score=radar_score,
-        price=price,
-        buy_zone_low=buy_zone_low,
-        buy_zone_high=buy_zone_high,
-        latest_vol=latest_vol,
-        avg_vol20=avg_vol20,
-        breakout_ok=breakout_10
-    )
-
-    return {
-        "市場": market,
-        "股票": symbol,
-        "現價": round(price, 2),
-        "20MA": round(ma20, 2),
-        "60MA": round(ma60, 2),
-        "量能": round(latest_vol, 0),
-        "20日均量": round(avg_vol20, 0),
-        "KD_K": round(k, 2),
-        "KD_D": round(d, 2),
-        "旗竿漲幅%": round(flagpole_return, 2),
-        "雷達分數": radar_score,
-        "基本面分": fundamental_score,
-        "技術面分": technical_score,
-        "訊號": signal,
-        "提醒": alert,
-        "建倉優先級": priority,
-        "買進區下緣": buy_zone_low,
-        "買進區上緣": buy_zone_high,
-        "停損價": stop_loss,
-        "停利價": take_profit,
-        "建議股數": suggested_shares,
-        "策略標記": " / ".join(strategy_tags[:4]) if strategy_tags else "一般強勢",
-        "備註": " / ".join(notes[:5]) if notes else "資料有限"
-    }
-
-def monitor_holdings(holdings_rows, capital, risk_percent):
+def run_scan(
+    symbols_tw: List[str],
+    symbols_us: List[str],
+    period: str,
+    stop_loss_pct: float,
+    take_profit_pct: float,
+    capital: float,
+    alloc_pct: float
+):
     results = []
+    df_map = {}
 
-    for row in holdings_rows:
-        symbol = str(row.get("股票", "")).strip().upper()
-        qty = float(row.get("股數", 0) or 0)
-        avg_cost = float(row.get("均價", 0) or 0)
-
-        if not symbol or qty <= 0 or avg_cost <= 0:
-            continue
-
-        df, real_symbol, market = fetch_symbol_data(symbol)
-
-        if df.empty:
+    for symbol in symbols_tw:
+        df = fetch_price_history(symbol, period=period)
+        df_map[symbol] = df
+        if not df.empty:
+            sig = calc_signal(df, stop_loss_pct, take_profit_pct)
             results.append({
-                "股票": symbol,
-                "市場": "未知",
-                "股數": qty,
-                "均價": avg_cost,
-                "現價": None,
-                "損益%": None,
-                "訊號": "查無資料",
-                "提醒": "無法抓取行情",
-                "建議": "請確認代碼",
-                "停損價": None,
-                "停利價": None,
-                "建倉優先級": "-"
-            })
-            continue
-
-        try:
-            signal_row = calc_radar_signal(df, real_symbol, market, capital, risk_percent)
-            current_price = float(signal_row["現價"])
-            pnl_pct = round((current_price / avg_cost - 1) * 100, 2)
-
-            if current_price <= signal_row["停損價"]:
-                advice = "🚨 停損警戒"
-            elif pnl_pct >= 15:
-                advice = "🎯 停利觀察"
-            elif signal_row["建倉優先級"].startswith("A"):
-                advice = "✅ 可續抱 / 強勢"
-            elif signal_row["訊號"] == "🟡 觀望":
-                advice = "⏳ 續抱觀察"
-            else:
-                advice = "⚠️ 考慮減碼"
-
-            results.append({
-                "股票": real_symbol,
-                "市場": market,
-                "股數": qty,
-                "均價": round(avg_cost, 2),
-                "現價": round(current_price, 2),
-                "損益%": pnl_pct,
-                "訊號": signal_row["訊號"],
-                "提醒": signal_row["提醒"],
-                "建議": advice,
-                "停損價": signal_row["停損價"],
-                "停利價": signal_row["停利價"],
-                "建倉優先級": signal_row["建倉優先級"]
-            })
-        except Exception:
-            results.append({
-                "股票": symbol,
-                "市場": market,
-                "股數": qty,
-                "均價": avg_cost,
-                "現價": None,
-                "損益%": None,
-                "訊號": "錯誤",
-                "提醒": "計算失敗",
-                "建議": "請稍後再試",
-                "停損價": None,
-                "停利價": None,
-                "建倉優先級": "-"
+                '市場': '台股',
+                '代碼': symbol,
+                '收盤': sig['close'],
+                '訊號': sig['signal'],
+                '建議進場價': sig['entry'],
+                '停損價': sig['stop'],
+                '第一停利價': sig['tp1'],
+                '評分': sig['score'],
+                '理由': sig['reason'],
             })
 
-    return pd.DataFrame(results)
+    for symbol in symbols_us:
+        df = fetch_price_history(symbol, period=period)
+        df_map[symbol] = df
+        if not df.empty:
+            sig = calc_signal(df, stop_loss_pct, take_profit_pct)
+            results.append({
+                '市場': '美股',
+                '代碼': symbol,
+                '收盤': sig['close'],
+                '訊號': sig['signal'],
+                '建議進場價': sig['entry'],
+                '停損價': sig['stop'],
+                '第一停利價': sig['tp1'],
+                '評分': sig['score'],
+                '理由': sig['reason'],
+            })
+
+    scan_df = pd.DataFrame(results)
+    if not scan_df.empty:
+        scan_df = scan_df.sort_values(['評分', '市場'], ascending=[False, True]).reset_index(drop=True)
+
+    top3_df = scan_df.head(3).copy() if not scan_df.empty else pd.DataFrame()
+    order_df = make_order_df(top3_df, capital, alloc_pct) if not top3_df.empty else pd.DataFrame()
+
+    st.session_state['scan_df'] = scan_df
+    st.session_state['top3_df'] = top3_df
+    st.session_state['order_df'] = order_df
+    st.session_state['df_map'] = df_map
+
 
 # =========================
-# 候選池
+# 初始化
 # =========================
-TW_CANDIDATES = ["2330", "2317", "2454", "2382", "2303", "3037", "2376", "3017", "2603", "2609", "00631L", "00637L"]
-US_CANDIDATES = ["NVDA", "AMD", "TSLA", "PLTR", "SMCI", "META", "AMZN", "AVGO", "MSFT", "QQQ"]
-
-# =========================
-# 預設狀態
-# =========================
-DEFAULT_WATCHLIST = "2330, 2317, 00631L, NVDA, TSLA, AMD"
-if "watchlist" not in st.session_state:
-    st.session_state.watchlist = load_watchlist_memory(DEFAULT_WATCHLIST)
-
-if "capital" not in st.session_state:
-    st.session_state.capital = 100000
-
-if "risk_percent" not in st.session_state:
-    st.session_state.risk_percent = 1.0
-
-if "only_tradeable" not in st.session_state:
-    st.session_state.only_tradeable = False
-
-if "holdings" not in st.session_state:
-    st.session_state.holdings = load_holdings()
+init_state()
 
 # =========================
-# UI
+# 手機優先樣式
 # =========================
-st.title("🛡️ V37 自動分組看板版")
-st.caption("A/B/C 分組看板｜台美股自動篩選｜庫存 + 候選股雙面板｜00631L 可查詢")
-
-st.subheader("📌 監控清單")
-watchlist = st.text_input("輸入股票（逗號分隔）", value=st.session_state.watchlist)
-save_watchlist_memory(watchlist)
-st.session_state.watchlist = watchlist
-
-st.subheader("📦 20檔現有庫存列表")
-holdings_df = pd.DataFrame(st.session_state.holdings)
-edited_holdings = st.data_editor(
-    holdings_df,
-    num_rows="fixed",
-    use_container_width=True,
-    column_config={
-        "股票": st.column_config.TextColumn("股票代碼"),
-        "股數": st.column_config.NumberColumn("股數", min_value=0, step=1),
-        "均價": st.column_config.NumberColumn("均價", min_value=0.0, step=0.1),
-    },
-    key="holdings_editor"
+st.markdown(
+    """
+    <style>
+    .block-container {
+        padding-top: 1rem;
+        padding-bottom: 4rem;
+        max-width: 1100px;
+    }
+    div[data-testid="stMetric"] {
+        background: rgba(240,242,246,0.55);
+        border-radius: 14px;
+        padding: 8px 10px;
+    }
+    .small-note {
+        font-size: 0.85rem;
+        opacity: 0.8;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
-save_col1, save_col2 = st.columns([1, 5])
-if save_col1.button("💾 儲存庫存列表"):
-    rows = edited_holdings.to_dict(orient="records")
-    st.session_state.holdings = rows
-    save_holdings(rows)
-    st.success("已儲存 20 檔庫存列表")
-
-st.subheader("⚙️ 資金模式")
-c1, c2, c3, c4 = st.columns(4)
-
-if c1.button("標準模式"):
-    st.session_state.capital = 100000
-    st.session_state.risk_percent = 1.0
-    st.session_state.only_tradeable = False
-
-if c2.button("小資可進攻 20K"):
-    st.session_state.capital = 20000
-    st.session_state.risk_percent = 2.0
-    st.session_state.only_tradeable = True
-
-if c3.button("進攻 30K"):
-    st.session_state.capital = 30000
-    st.session_state.risk_percent = 2.0
-    st.session_state.only_tradeable = True
-
-if c4.button("積極 50K"):
-    st.session_state.capital = 50000
-    st.session_state.risk_percent = 1.5
-    st.session_state.only_tradeable = True
-
-capital = st.number_input("總資金", min_value=10000, value=int(st.session_state.capital), step=10000)
-risk_percent = st.slider("單筆風險比例 (%)", min_value=0.5, max_value=5.0, value=float(st.session_state.risk_percent), step=0.5)
-only_tradeable = st.checkbox("只顯示 🟢 可打", value=st.session_state.only_tradeable)
-
-st.session_state.capital = capital
-st.session_state.risk_percent = risk_percent
-st.session_state.only_tradeable = only_tradeable
-
-st.subheader("🔎 篩選模式")
-m1, m2, m3, m4, m5 = st.columns(5)
-scan_watchlist = m1.button("掃描監控清單")
-scan_tw_auto = m2.button("台股自動篩選")
-scan_us_auto = m3.button("美股自動篩選")
-scan_holdings_btn = m4.button("監控現有庫存")
-test_line_clicked = m5.button("測試 LINE 推播")
-
-if test_line_clicked:
-    ok, msg = push_line("V37 測試推播成功")
-    if ok:
-        st.success(msg)
-    else:
-        st.warning(msg)
-
-results = []
-failed_symbols = []
-symbols_to_scan = []
-
-if scan_watchlist:
-    symbols_to_scan = [x.strip().upper() for x in watchlist.split(",") if x.strip()]
-elif scan_tw_auto:
-    symbols_to_scan = TW_CANDIDATES
-elif scan_us_auto:
-    symbols_to_scan = US_CANDIDATES
-
-if symbols_to_scan:
-    for s in symbols_to_scan:
-        df, real_symbol, market = fetch_symbol_data(s)
-
-        if df.empty:
-            failed_symbols.append(s)
-            continue
-
-        try:
-            row = calc_radar_signal(df, real_symbol, market, capital, risk_percent)
-            results.append(row)
-        except Exception:
-            failed_symbols.append(s)
-
-holdings_result_df = pd.DataFrame()
-if scan_holdings_btn or (st.session_state.holdings and len(st.session_state.holdings) > 0):
-    holdings_result_df = monitor_holdings(st.session_state.holdings, capital, risk_percent)
-
-candidate_df = pd.DataFrame(results) if results else pd.DataFrame()
-if not candidate_df.empty and only_tradeable:
-    candidate_df = candidate_df[candidate_df["訊號"] == "🟢 可打"]
-
-a_df = pd.DataFrame()
-b_df = pd.DataFrame()
-c_df = pd.DataFrame()
-
-if not candidate_df.empty:
-    a_df = candidate_df[candidate_df["建倉優先級"] == "A級：可優先建倉"].copy()
-    b_df = candidate_df[candidate_df["建倉優先級"] == "B級：觀察等確認"].copy()
-    c_df = candidate_df[candidate_df["建倉優先級"] == "C級：先避開"].copy()
+# =========================
+# Sidebar
+# =========================
+st.sidebar.title('📱 V38.1 手機版設定')
+capital = st.sidebar.number_input('總資金', min_value=10000, value=DEFAULT_CAPITAL, step=10000)
+max_positions = st.sidebar.slider('同時持倉上限', 1, 5, DEFAULT_MAX_POSITIONS)
+single_position_pct = st.sidebar.slider('單檔上限 %', 10, 50, int(DEFAULT_SINGLE_POSITION_PCT * 100), step=5) / 100
+stop_loss_pct = st.sidebar.slider('固定停損 %', 2, 10, int(DEFAULT_STOP_LOSS_PCT * 100)) / 100
+take_profit_pct = st.sidebar.slider('第一停利 %', 5, 20, int(DEFAULT_TAKE_PROFIT_PCT * 100)) / 100
+daily_loss_stop_pct = st.sidebar.slider('當日停手機制 %', 2, 10, int(DEFAULT_DAILY_LOSS_STOP_PCT * 100)) / 100
+period = st.sidebar.selectbox('抓取區間', ['3mo', '6mo', '1y'], index=1)
+tw_symbols = parse_symbols(st.sidebar.text_area('台股清單', ','.join(TW_DEFAULTS), height=90))
+us_symbols = parse_symbols(st.sidebar.text_area('美股清單', ','.join(US_DEFAULTS), height=90))
 
 # =========================
-# 看板區
+# Header
 # =========================
-st.markdown("---")
-st.subheader("📊 自動分組看板")
+st.title('📈 V38.1 手機版強化介面')
+st.caption('分頁式操作：狙擊清單 / 下單表 / 持倉 / 紀錄 / 設定與推播')
 
-dashboard_col1, dashboard_col2 = st.columns(2)
+h1, h2, h3, h4 = st.columns(4)
+h1.metric('總資金', f'{capital:,.0f}')
+h2.metric('持倉上限', f'{max_positions} 檔')
+h3.metric('單檔上限', f'{single_position_pct:.0%}')
+h4.metric('當日停手', f'{daily_loss_stop_pct:.0%}')
 
-with dashboard_col1:
-    st.markdown('<div class="panel">', unsafe_allow_html=True)
-    st.markdown("## 🟢 A級優先建倉")
-    if not a_df.empty:
-        st.dataframe(a_df, use_container_width=True)
-    else:
-        st.info("目前沒有 A級標的")
-    st.markdown('</div>', unsafe_allow_html=True)
+if st.button('🔍 立即重新掃描', type='primary', use_container_width=True):
+    run_scan(tw_symbols, us_symbols, period, stop_loss_pct, take_profit_pct, capital, single_position_pct)
 
-    st.markdown('<div class="panel">', unsafe_allow_html=True)
-    st.markdown("## 🔴 C級避開")
-    if not c_df.empty:
-        st.dataframe(c_df, use_container_width=True)
-    else:
-        st.info("目前沒有 C級標的")
-    st.markdown('</div>', unsafe_allow_html=True)
+if st.session_state['scan_df'].empty:
+    run_scan(tw_symbols, us_symbols, period, stop_loss_pct, take_profit_pct, capital, single_position_pct)
 
-with dashboard_col2:
-    st.markdown('<div class="panel">', unsafe_allow_html=True)
-    st.markdown("## 🟡 B級觀察")
-    if not b_df.empty:
-        st.dataframe(b_df, use_container_width=True)
-    else:
-        st.info("目前沒有 B級標的")
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    st.markdown('<div class="panel">', unsafe_allow_html=True)
-    st.markdown("## 📦 現有庫存警戒")
-    if not holdings_result_df.empty:
-        warning_df = holdings_result_df[
-            holdings_result_df["建議"].isin(["🚨 停損警戒", "🎯 停利觀察", "⚠️ 考慮減碼"])
-        ]
-        if not warning_df.empty:
-            st.dataframe(warning_df, use_container_width=True)
-        else:
-            st.dataframe(holdings_result_df, use_container_width=True)
-    else:
-        st.info("目前沒有庫存資料")
-    st.markdown('</div>', unsafe_allow_html=True)
+scan_df = st.session_state['scan_df']
+top3_df = st.session_state['top3_df']
+order_df = st.session_state['order_df']
+df_map = st.session_state['df_map']
+positions_live = update_position_prices(df_map)
 
 # =========================
-# 候選股操作中心
+# Tabs
 # =========================
-st.markdown("---")
-st.subheader("💰 今日建倉操作中心")
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    '🎯 狙擊清單',
+    '📋 下單表',
+    '💼 持倉追蹤',
+    '🧾 交易紀錄',
+    '⚙️ 推播 / 設定'
+])
 
-tradable_df = pd.DataFrame()
-if not a_df.empty:
-    tradable_df = a_df.copy()
-elif not b_df.empty:
-    tradable_df = b_df.copy()
+with tab1:
+    st.subheader('明日實戰 3 檔')
 
-if not tradable_df.empty:
-    top3 = tradable_df.sort_values(["雷達分數", "現價"], ascending=[False, True]).head(3)
+    if top3_df.empty:
+        st.warning('尚無可用結果')
+    else:
+        st.dataframe(top3_df, use_container_width=True, hide_index=True)
 
-    st.markdown("### 🏆 今日候選 Top 3")
-    cols = st.columns(min(3, len(top3)))
+        quick_cards = st.columns(min(3, len(top3_df)))
+        for i, (_, row) in enumerate(top3_df.iterrows()):
+            with quick_cards[i]:
+                st.markdown(f"**{row['代碼']}**")
+                st.caption(f"{row['市場']}｜{row['訊號']}")
+                st.write(f"進場：{row['建議進場價']}")
+                st.write(f"停損：{row['停損價']}")
+                st.write(f"停利：{row['第一停利價']}")
 
-    for i, (_, row) in enumerate(top3.iterrows()):
-        with cols[i]:
-            priority = row["建倉優先級"]
-            card_class = "card-a" if priority.startswith("A") else ("card-b" if priority.startswith("B") else "card-c")
-            tag_class = "tag-green" if priority.startswith("A") else ("tag-yellow" if priority.startswith("B") else "tag-red")
+        symbol = st.selectbox('查看圖表', options=top3_df['代碼'].tolist())
+        draw_chart(df_map.get(symbol, pd.DataFrame()), symbol)
 
-            st.markdown(
-                f"""
-                <div class="card {card_class}">
-                    <div class="tag {tag_class}">{priority}</div>
-                    <div class="tag tag-blue">{row['市場']}</div>
-                    <div class="big-number">{row['股票']}</div>
-                    <p><b>訊號：</b>{row['訊號']}</p>
-                    <p><b>提醒：</b>{row['提醒']}</p>
-                    <p><b>現價：</b>{row['現價']}</p>
-                    <p><b>買進區：</b>{row['買進區下緣']} ~ {row['買進區上緣']}</p>
-                    <p><b>停損：</b>{row['停損價']}</p>
-                    <p><b>停利：</b>{row['停利價']}</p>
-                    <p><b>建議股數：</b>{row['建議股數']}</p>
-                    <p class="small-muted">{row['策略標記']}</p>
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
+        st.subheader('完整排行')
+        st.dataframe(scan_df, use_container_width=True, hide_index=True)
 
-    if ENABLE_LINE and st.button("推播 A級 / 優先名單到 LINE"):
-        a_list = tradable_df[tradable_df["建倉優先級"] == "A級：可優先建倉"]
-        source_df = a_list if not a_list.empty else top3
-        msg_lines = ["🚦 V37 今日優先建倉名單"]
-        for _, row in source_df.iterrows():
-            msg_lines.append(
-                f"{row['股票']} | {row['建倉優先級']} | {row['訊號']} | 現價:{row['現價']} | 停損:{row['停損價']} | 停利:{row['停利價']}"
-            )
-        ok, msg = push_line("\n".join(msg_lines))
-        if ok:
-            st.success("已推播到 LINE")
-        else:
-            st.warning(msg)
+with tab2:
+    st.subheader('國泰手動下單表')
 
-    st.markdown("### 🧾 國泰手動下單摘要")
-    selected_symbol = st.selectbox("選擇候選標的", top3["股票"].tolist(), key="candidate_select")
-    selected_row = top3[top3["股票"] == selected_symbol].iloc[0]
-
-    order_price = st.number_input("下單價格", value=float(selected_row["現價"]), step=0.1, key="candidate_price")
-    order_qty = st.number_input("下單股數", value=max(int(selected_row["建議股數"]), 1), step=1, min_value=1, key="candidate_qty")
-    order_action = st.selectbox("操作", ["BUY 買進", "SELL 賣出", "REDUCE 減碼"], key="candidate_action")
-
-    st.write(f"市場：{selected_row['市場']}")
-    st.write(f"標的：{selected_symbol}")
-    st.write(f"建倉優先級：{selected_row['建倉優先級']}")
-    st.write(f"訊號：{selected_row['訊號']}")
-    st.write(f"提醒：{selected_row['提醒']}")
-    st.write(f"策略標記：{selected_row['策略標記']}")
-    st.write(f"操作：{order_action}")
-    st.write(f"價格：{order_price}")
-    st.write(f"股數：{order_qty}")
-    st.write(f"停損：{selected_row['停損價']}")
-    st.write(f"停利：{selected_row['停利價']}")
-
-    if ENABLE_LINE and st.button("推播 V37 候選股摘要到 LINE", key="candidate_line_push"):
-        msg = (
-            f"🏛️ V37 候選股下單摘要\n"
-            f"市場：{selected_row['市場']}\n"
-            f"標的：{selected_symbol}\n"
-            f"建倉優先級：{selected_row['建倉優先級']}\n"
-            f"訊號：{selected_row['訊號']}\n"
-            f"提醒：{selected_row['提醒']}\n"
-            f"策略標記：{selected_row['策略標記']}\n"
-            f"操作：{order_action}\n"
-            f"價格：{order_price}\n"
-            f"股數：{order_qty}\n"
-            f"停損：{selected_row['停損價']}\n"
-            f"停利：{selected_row['停利價']}"
+    if order_df.empty:
+        st.warning('尚無下單表')
+    else:
+        st.dataframe(order_df, use_container_width=True, hide_index=True)
+        st.download_button(
+            '⬇️ 下載 CSV',
+            order_df.to_csv(index=False).encode('utf-8-sig'),
+            'v38_1_cathay_orders.csv',
+            'text/csv'
         )
-        ok, line_msg = push_line(msg)
-        if ok:
-            st.success("已推播候選股摘要")
-        else:
-            st.warning(line_msg)
-else:
-    st.info("目前沒有可操作標的")
 
-# =========================
-# 底部錯誤區
-# =========================
-if failed_symbols:
-    st.markdown("---")
-    st.subheader("⚠️ 無法取得資料的股票")
-    st.write(", ".join(failed_symbols))
+        st.markdown('**快速執行守則**')
+        st.markdown(
+            '- 不突破不買\n'
+            '- 弱於 5MA 不追\n'
+            '- 觸價前先確認量能\n'
+            '- 跌破停損不凹單'
+        )
+
+with tab3:
+    st.subheader('持倉追蹤面板')
+    pos_df = positions_live
+
+    edited_pos = st.data_editor(
+        pos_df,
+        use_container_width=True,
+        hide_index=True,
+        num_rows='dynamic',
+        key='positions_editor'
+    )
+
+    if st.button('💾 儲存持倉', key='save_positions_btn', use_container_width=True):
+        save_positions(edited_pos.fillna('').to_dict('records'))
+        st.success('持倉已儲存')
+
+    if not edited_pos.empty:
+        valid_returns = pd.to_numeric(edited_pos['報酬率%'], errors='coerce')
+        avg_ret = valid_returns.mean() if valid_returns.notna().any() else 0
+
+        p1, p2 = st.columns(2)
+        p1.metric('持倉檔數', len(edited_pos))
+        p2.metric('平均報酬率%', f'{avg_ret:.2f}')
+
+with tab4:
+    st.subheader('交易紀錄')
+    log_df = trade_log_df()
+
+    edited_log = st.data_editor(
+        log_df,
+        use_container_width=True,
+        hide_index=True,
+        num_rows='dynamic',
+        key='trade_log_editor'
+    )
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button('💾 儲存交易紀錄', use_container_width=True):
+            save_trade_log(edited_log.fillna('').to_dict('records'))
+            st.success('交易紀錄已儲存')
+
+    with c2:
+        if not edited_log.empty:
+            st.download_button(
+                '⬇️ 匯出交易紀錄 CSV',
+                edited_log.to_csv(index=False).encode('utf-8-sig'),
+                'v38_1_trade_log.csv',
+                'text/csv',
+                use_container_width=True
+            )
+
+with tab5:
+    st.subheader('LINE 推播 / 風控摘要')
+    alert_text = build_alert_text(top3_df)
+    st.code(alert_text)
+
+    x1, x2 = st.columns(2)
+    with x1:
+        if st.button('發送 LINE 訊號', use_container_width=True):
+            ok, msg = send_line(alert_text)
+            if ok:
+                st.success(msg)
+            else:
+                st.error(msg)
+
+    with x2:
+        st.info('已設定' if line_enabled() else '尚未設定 LINE secrets')
+
+    st.markdown('**手機版優化內容**')
+    st.markdown(
+        '- 分頁式操作，減少單頁過長\n'
+        '- 快速卡片化 3 檔狙擊清單\n'
+        '- 內建持倉追蹤與交易紀錄\n'
+        '- 一頁完成推播與下載 CSV'
+    )
+
+    st.markdown('**注意**')
+    st.markdown(
+        '- 本版仍為國泰手動下單流程\n'
+        '- 若要盤中自動刷新，可再升級輪詢版\n'
+        '- 若要雲端部署，可直接上 Streamlit Community Cloud 或 VPS'
+    )
+
+st.markdown('---')
+st.caption('V38.1 手機版：研究與決策輔助用途，不保證獲利。')
